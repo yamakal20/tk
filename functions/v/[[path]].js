@@ -1,18 +1,10 @@
 // functions/v/[[path]].js
 // ★ catch-all route — /v/{id}.mp4 ရော /v/{id}/{filename} ရော ဖမ်းနိုင်
 // tktube get_file → R2 direct link resolve လုပ်ပြီး proxy ပြန်ထုတ်
-//
-// ★ optimization များ:
-//   1) cache TTL ကို R2 expire (3600s) နဲ့ နီးစပ်အောင် 3000s (50min) တင်
-//   2) resolveTktube မှာ HEAD သုံး (body မဆွဲ → ပိုမြန်)
-//   3) cache miss အခါ ပထမ resolve ပြီးတာနဲ့ ချက်ချင်း KV write
-//   4) ?dl=1 ဆိုရင်သာ download၊ default က stream (play) ဖြစ်
-//   5) expired link auto re-resolve
+// ★ FIX: download manager (movie apk) file size စစ်နိုင်အောင် Content-Length မှန်အောင် ပြန်ပေး
 
-// ★ R2 presigned link 1 နာရီ ခံတယ်။ buffer 10min ထားပြီး 50min cache
-const CACHE_TTL = 3000; // 50 မိနစ် (စက္ကန့်)
+const CACHE_TTL = 3000; // 50 မိနစ်
 
-// ★ resolve လုပ်တဲ့အခါ player/UA header
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/120.0 Safari/537.36";
@@ -25,33 +17,27 @@ export async function onRequest(context) {
   }
 
   // ───────────────────────────────────────────────
-  // ★ path ပိုင်းခြား
   let segments = params.path;
   if (typeof segments === "string") segments = [segments];
   if (!Array.isArray(segments) || segments.length === 0) {
     return new Response("Invalid path", { status: 400 });
   }
 
-  // ★ ID = ပထမ segment (extension ဖယ်)
   let id = segments[0];
   if (id.includes(".")) id = id.substring(0, id.lastIndexOf("."));
 
-  // ★ URL path ထဲက filename
   let urlFilename = "";
   if (segments.length >= 2) {
     urlFilename = decodeURIComponent(segments[segments.length - 1]);
   }
 
-  // source link ရှာ
   const srcUrl = await env.LINKS.get(id);
   if (!srcUrl) {
     return new Response("ID ရှာမတွေ့ပါ", { status: 404 });
   }
 
-  // ★ custom filename (KV)
   const customName = await env.LINKS.get("name:" + id);
 
-  // ★ download mode ဟုတ်မဟုတ် (?dl=1)
   const reqUrl = new URL(request.url);
   const forceDownload = reqUrl.searchParams.get("dl") === "1";
 
@@ -69,12 +55,10 @@ export async function onRequest(context) {
     if (!direct) {
       return new Response("Direct link ရှာမတွေ့ပါ", { status: 502 });
     }
-    // ★ ချက်ချင်း cache write — နောက်လာမယ့် range request တွေ resolve မလုပ်တော့
     await env.LINKS.put(cacheKey, direct, { expirationTtl: CACHE_TTL });
   }
 
   // ───────────────────────────────────────────────
-  // ★ ဖိုင်နာမည်
   const filename =
     urlFilename || customName || extractFilename(srcUrl, direct);
 
@@ -82,7 +66,7 @@ export async function onRequest(context) {
   // ★ upstream fetch (Range forward)
   let upstream = await fetchUpstream(direct, request);
 
-  // ★ link expire (403/410/404) → ပြန် resolve ပြီး ထပ်ကြိုး
+  // ★ link expire → ပြန် resolve
   if (
     upstream.status === 403 ||
     upstream.status === 410 ||
@@ -99,21 +83,65 @@ export async function onRequest(context) {
   // ───────────────────────────────────────────────
   // ★ response headers
   const respHeaders = new Headers();
-  for (const h of [
-    "content-length",
-    "content-range",
-    "accept-ranges",
-    "last-modified",
-    "etag",
-  ]) {
+
+  // ★ upstream content-length / content-range ကို forward
+  const upLen = upstream.headers.get("content-length");
+  const upRange = upstream.headers.get("content-range");
+
+  for (const h of ["content-range", "last-modified", "etag"]) {
     const v = upstream.headers.get(h);
     if (v) respHeaders.set(h, v);
   }
+
+  // ★★★ FIX 1: Content-Length မှန်အောင် ─────────────
+  // download manager က file size ကို Content-Length ကနေ ဖတ်တယ်။
+  // Range request (bytes=0-0) ဖြစ်ရင် partial length ပဲ ပြန်လာတာမို့
+  // Content-Range ထဲက total size ကို ထုတ်ပြီး "full size" ကို တွက်ပေး။
+  let totalSize = null;
+  if (upRange) {
+    // format: "bytes 0-0/123456789"
+    const m = upRange.match(/\/(\d+)\s*$/);
+    if (m) totalSize = m[1];
+  }
+
+  const reqHasRange = !!request.headers.get("Range");
+
+  if (request.method === "HEAD") {
+    // ★ HEAD မှာ download manager က total size လိုတယ် → totalSize ပေး
+    if (totalSize) {
+      respHeaders.set("Content-Length", totalSize);
+      // HEAD မှာ partial range header မလို
+      respHeaders.delete("content-range");
+    } else if (upLen) {
+      respHeaders.set("Content-Length", upLen);
+    }
+  } else {
+    // GET
+    if (reqHasRange) {
+      // range request → upstream length အတိုင်း
+      if (upLen) respHeaders.set("Content-Length", upLen);
+    } else {
+      // full GET → total size (သို့) upstream length
+      if (totalSize) respHeaders.set("Content-Length", totalSize);
+      else if (upLen) respHeaders.set("Content-Length", upLen);
+    }
+  }
+  // ──────────────────────────────────────────────────
+
   respHeaders.set("Access-Control-Allow-Origin", "*");
   respHeaders.set("Accept-Ranges", "bytes");
 
+  // ★★★ FIX 2: HEAD request မှာ status code ──────────
+  // download manager က HEAD ကို 200 မျှော်တယ်။
+  // upstream က Range မပါဘဲ HEAD ခေါ်ရင် 200 ပြန်လာသင့်။
+  let respStatus = upstream.status;
+  if (request.method === "HEAD") {
+    // HEAD မှာ 206 ဖြစ်နေရင် 200 ပြန်ပြောင်း (size စစ်ရုံ)
+    respStatus = upstream.status === 206 ? 200 : upstream.status;
+  }
+  // ──────────────────────────────────────────────────
+
   if (forceDownload) {
-    // ★★★ ?dl=1 → ဖိုင်တန်းဒေါင်း ★★★
     respHeaders.set("Content-Type", "application/octet-stream");
     respHeaders.set(
       "Content-Disposition",
@@ -121,7 +149,6 @@ export async function onRequest(context) {
         `filename*=UTF-8''${encodeURIComponent(filename)}`
     );
   } else {
-    // ★★★ default → browser/player မှာ play (stream) ဖြစ်အောင် ★★★
     const upstreamType = upstream.headers.get("content-type");
     respHeaders.set(
       "Content-Type",
@@ -136,35 +163,50 @@ export async function onRequest(context) {
     );
   }
 
-  return new Response(upstream.body, {
-    status: upstream.status,
+  // ★ HEAD မှာ body မပါ
+  const body = request.method === "HEAD" ? null : upstream.body;
+
+  return new Response(body, {
+    status: respStatus,
     headers: respHeaders,
   });
 }
 
 // ───────────────────────────────────────────────
 // ★ upstream fetch helper (Range + UA forward)
+//   ★ FIX 3: HEAD request လာရင် upstream ကို "bytes=0-0" Range GET နဲ့ ခေါ်
+//            → R2 က Content-Range ထဲ total size ပြန်ပေးအောင်
 async function fetchUpstream(direct, request) {
   const fwdHeaders = new Headers();
-  const range = request.headers.get("Range");
-  if (range) fwdHeaders.set("Range", range);
   fwdHeaders.set("User-Agent", UA);
 
+  if (request.method === "HEAD") {
+    // ★ HEAD: R2 က HEAD ကို Content-Length ပြန်မပေးတတ်တာမို့
+    //   bytes=0-0 GET နဲ့ ခေါ်ပြီး Content-Range ထဲက total size ယူ
+    fwdHeaders.set("Range", "bytes=0-0");
+    return fetch(direct, {
+      method: "GET",
+      headers: fwdHeaders,
+      redirect: "follow",
+    });
+  }
+
+  const range = request.headers.get("Range");
+  if (range) fwdHeaders.set("Range", range);
+
   return fetch(direct, {
-    method: request.method === "HEAD" ? "HEAD" : "GET",
+    method: "GET",
     headers: fwdHeaders,
     redirect: "follow",
   });
 }
 
 // ───────────────────────────────────────────────
-// filename sanitize
 function sanitizeAscii(name) {
   return name.replace(/["\\\r\n]/g, "_").replace(/[^\x20-\x7E]/g, "_");
 }
 
 // ───────────────────────────────────────────────
-// filename extract
 function extractFilename(srcUrl, directUrl) {
   try {
     const parts = new URL(srcUrl).pathname.split("/").filter(Boolean);
@@ -182,8 +224,6 @@ function extractFilename(srcUrl, directUrl) {
 }
 
 // ───────────────────────────────────────────────
-// ★ tktube get_file → R2 direct link resolve
-//   ★ HEAD သုံး → body မဆွဲ → ပိုမြန် (redirect Location ပဲ လို)
 async function resolveTktube(srcUrl) {
   const headers = {
     "User-Agent": UA,
@@ -199,7 +239,6 @@ async function resolveTktube(srcUrl) {
       redirect: "manual",
     });
 
-    // ★ server တချို့ HEAD ကို 405/501 ပြန်တတ် → GET fallback
     if (res.status === 405 || res.status === 501) {
       res = await fetch(currentUrl, {
         method: "GET",
@@ -208,7 +247,6 @@ async function resolveTktube(srcUrl) {
       });
     }
 
-    // 3xx → Location
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get("Location");
       if (!loc) break;
@@ -224,7 +262,6 @@ async function resolveTktube(srcUrl) {
       continue;
     }
 
-    // redirect မဟုတ်တော့ — ဒီ URL ကိုယ်တိုင် R2 link ဖြစ်နိုင်
     if (
       /r2\.cloudflarestorage\.com/i.test(currentUrl) ||
       /X-Amz-Signature=/i.test(currentUrl)
