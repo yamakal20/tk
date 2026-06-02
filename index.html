@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="my">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>tktube Permanent Link</title>
+  <style>
+    body { font-family: sans-serif; max-width: 720px; margin: 30px auto; padding: 0 16px; background:#111; color:#eee; }
+    label { display:block; margin-top:14px; margin-bottom:6px; font-size:14px; color:#aaa; }
+    input { width: 100%; padding: 12px; font-size: 15px; box-sizing: border-box; border-radius:8px; border:1px solid #444; background:#1c1c1c; color:#eee; }
+    button { padding: 12px 20px; font-size: 15px; margin-top: 14px; cursor: pointer; border:0; border-radius:8px; background:#3b82f6; color:#fff; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    .link { background:#1c1c1c; padding:12px; border-radius:8px; margin-top:12px; border:1px solid #333; word-break:break-all; }
+    a { color:#60a5fa; }
+    .dl-btn { display:inline-block; margin-top:12px; padding:12px 20px; background:#22c55e; color:#fff; border-radius:8px; text-decoration:none; }
+    .copy-btn { display:inline-block; margin-top:12px; margin-left:8px; padding:12px 20px; background:#6b7280; color:#fff; border-radius:8px; cursor:pointer; border:0; }
+    .err { color:#f87171; }
+    .hint { font-size:12px; color:#666; margin-top:4px; }
+    .hidden { display:none; }
+  </style>
+</head>
+<body>
+
+  <!-- ★★★ Login screen ★★★ -->
+  <div id="loginBox">
+    <h2>🔒 ဝင်ရောက်ရန်</h2>
+    <p>ဆက်လုပ်ဖို့ password ထည့်ပါ။</p>
+    <label for="pw">Password</label>
+    <input id="pw" type="password" placeholder="password" onkeydown="if(event.key==='Enter')login()" />
+    <button id="loginBtn" onclick="login()">ဝင်မယ်</button>
+    <div id="loginErr"></div>
+  </div>
+
+  <!-- ★★★ App screen (login အောင်မှ ပြ) ★★★ -->
+  <div id="appBox" class="hidden">
+    <h2>📥 tktube → Permanent Download Link</h2>
+    <p>tktube get_file link ထည့်ပါ — link ကိုနှိပ်တာနဲ့ ဖိုင်တန်းဒေါင်းတဲ့ permanent link ရပါမယ်။</p>
+
+    <label for="mf">tktube get_file Link</label>
+    <input id="mf" type="text" placeholder="https://tktube.com/get_file/..." />
+
+    <label for="fn">ဖိုင်နာမည် (optional)</label>
+    <input id="fn" type="text" placeholder="ဥပမာ — myvideo.mp4" />
+    <div class="hint">ထည့်မထားရင် မူရင်းဖိုင်နာမည် အလိုအလျောက်သုံးပါမယ်။</div>
+
+    <button id="btn" onclick="add()">Link ထုတ်ရန်</button>
+    <div id="out"></div>
+  </div>
+
+  <script>
+    // ───────────── Login ─────────────
+    async function login() {
+      const pw = document.getElementById("pw").value;
+      const err = document.getElementById("loginErr");
+      const btn = document.getElementById("loginBtn");
+      err.innerHTML = "";
+
+      if (!pw) { err.innerHTML = '<p class="err">password ထည့်ပါ</p>'; return; }
+
+      btn.disabled = true;
+      try {
+        const r = await fetch("/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: pw }),
+        });
+        const j = await r.json();
+        if (r.ok && j.ok) {
+          // ★ cookie ကျသွားပြီ → app ပြ
+          showApp();
+        } else {
+          err.innerHTML = '<p class="err">' + (j.error || "မအောင်မြင်ပါ") + '</p>';
+        }
+      } catch (e) {
+        err.innerHTML = '<p class="err">Error: ' + e.message + '</p>';
+      } finally {
+        btn.disabled = false;
+        document.getElementById("pw").value = "";
+      }
+    }
+
+    function showApp() {
+      document.getElementById("loginBox").classList.add("hidden");
+      document.getElementById("appBox").classList.remove("hidden");
+    }
+
+    // ───────────── Add link ─────────────
+    async function add() {
+      const mf = document.getElementById("mf").value.trim();
+      const fn = document.getElementById("fn").value.trim();
+      const out = document.getElementById("out");
+      const btn = document.getElementById("btn");
+
+      if (!mf) { out.innerHTML = '<p class="err">link ထည့်ပါ</p>'; return; }
+
+      btn.disabled = true;
+      out.innerHTML = "⏳ ...";
+
+      try {
+        let api = "/add?url=" + encodeURIComponent(mf);
+        if (fn) api += "&name=" + encodeURIComponent(fn);
+
+        const r = await fetch(api);
+
+        // ★ session expire ဖြစ်ရင် login ပြန်ပြ
+        if (r.status === 401) {
+          out.innerHTML = '<p class="err">Session ကုန်သွားပါပြီ — login ပြန်ဝင်ပါ</p>';
+          document.getElementById("appBox").classList.add("hidden");
+          document.getElementById("loginBox").classList.remove("hidden");
+          return;
+        }
+
+        const j = await r.json();
+        if (j.error) { out.innerHTML = '<p class="err">' + j.error + '</p>'; return; }
+
+        const safeLink = j.link.replace(/"/g, "&quot;");
+
+        out.innerHTML = `
+          <div class="link"><b>Permanent Download Link:</b><br>
+            <a id="result" href="${safeLink}">${j.link}</a>
+          </div>
+          <a class="dl-btn" href="${safeLink}" download>⬇️ Download ဆွဲရန်</a>
+          <button class="copy-btn" id="copyBtn">📋 Copy</button>
+          ${j.name ? '<div class="hint">ဖိုင်နာမည်: ' + j.name + '</div>' : ''}
+        `;
+
+        document.getElementById("copyBtn").addEventListener("click", function () {
+          navigator.clipboard.writeText(j.link).then(() => {
+            alert("Link copy လုပ်ပြီးပါပြီ ✓");
+          });
+        });
+      } catch (e) {
+        out.innerHTML = '<p class="err">Error: ' + e.message + '</p>';
+      } finally {
+        btn.disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>
