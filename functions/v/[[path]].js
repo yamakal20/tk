@@ -1,18 +1,11 @@
 // functions/v/[[path]].js
 // /v/{id}.mp4 နှင့် /v/{id}/{filename} နှစ်မျိုးလုံး support
 //
-// ★ ပန်းတိုင်:
-//   1) video အမြန်ဆုံးလာ (TTFB မြန်) — chunk-by-chunk pass-through stream
-//   2) seek (ရှေ့ကျော်/နောက်ရစ်) အဆင်ပြေ — Range forward + Accept-Ranges
-//   3) KV read အနည်းဆုံး — meta cache hit ဆို KV မဖတ်၊ miss ဆို parallel get
-//   4) Worker subrequest/CPU အနည်းဆုံး — direct link short-circuit (resolve မလို)
-//   5) direct / no-exp (အမြဲသုံး) link — အရှည်ဆုံး cache, network round-trip မရှိ
-//
-// ★★ ပြင်ဆင်ချက် (javtiful engine ပြောင်းသွားလို့):
-//   javtiful က R2 link တန်းမပြန်တော့ဘဲ /media/video/{id}/{quality}?expires=..&signature=..
-//   ဆိုတဲ့ "gateway link" ပြန်တယ်။ ဒါကို ထပ် resolve လုပ်မှ တကယ့် video ရောက်တယ်။
-//   ဒါ့ကြောင့် isMediaGatewayUrl() ထည့်ပြီး၊ isDirectLink() က ဒါကို direct မထင်စေဘဲ
-//   resolve loop တစ်ဆင့် ပိုဖြတ်အောင် ပြင်ထားတယ်။
+// ★★ ပြင်ဆင်ချက် (javtiful engine ထပ်ပြောင်း):
+//   (1) R2 link (engine အဟောင်း)
+//   (2) /media/video/{id}/{quality}?expires=..&signature=.. gateway link
+//   (3) ★★★ အသစ် — fast-stream.jav.si/p/{hash-chain} direct video link
+//       (R2/media မသုံးဘဲ page ကနေ တန်းထွက်လာတဲ့ link) — ထပ် resolve မလို၊ direct
 
 const META_TTL = 3000;            // meta cache TTL = 50 မိနစ် (seconds)
 const RESOLVE_LIMIT = 8;          // redirect chain max hop
@@ -24,19 +17,22 @@ const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/120.0 Safari/537.36";
 
-// "direct video" host pattern (.mp4 မပါ၊ exp မပါပေမဲ့ video တန်းပြန်တဲ့ host)
-// ★ tktube / mmtube (get_file engine) ကိုပါ ထည့်
+// "direct video" host pattern
+// ★ tktube / mmtube (get_file engine) + ★★★ fast-stream.jav.si ကိုပါ ထည့်
 const DIRECT_HOST_RE =
-  /(?:qyshare\.com|r2\.cloudflarestorage\.com|\.r2\.dev|cloudflarestream\.com|tktube\.com|mmtube\.net)/i;
+  /(?:qyshare\.com|r2\.cloudflarestorage\.com|\.r2\.dev|cloudflarestream\.com|tktube\.com|mmtube\.net|fast-stream\.jav\.si|(?:^|\.)jav\.si)/i;
 
 // token-ish direct endpoint (qyshare /api/share/download?token=...&fileId=...)
 const DIRECT_PATH_RE =
   /\/(?:api\/share\/download|get_file|dl|download|stream)\b/i;
 
 // ★★ javtiful gateway link — /media/video/{id}/{quality}?expires=..&signature=..
-//     ဒါက direct video မဟုတ်၊ ထပ် resolve လုပ်ရမယ့် intermediate link
 const MEDIA_GATEWAY_RE =
   /\/media\/video\/\d+\/[A-Za-z0-9]+/i;
+
+// ★★★ အသစ် — fast-stream.jav.si/p/{hash-chunk-chain} direct video link
+const FAST_STREAM_RE =
+  /\/p\/[0-9a-f]{4,}(?:-[0-9a-f]{2,})+/i;
 
 export async function onRequest(context) {
   const { request, params, env } = context;
@@ -69,8 +65,7 @@ export async function onRequest(context) {
 
   let meta = null;
 
-  // ───────────────────────────────────────────────
-  // STEP 1: meta cache ဖတ် (KV ကို မထိ — အမြန်ဆုံး path)
+  // STEP 1: meta cache ဖတ်
   const cachedMeta = await cache.match(metaCacheUrl);
   if (cachedMeta) {
     try {
@@ -78,15 +73,11 @@ export async function onRequest(context) {
     } catch (_) {
       meta = null;
     }
-
-    // hard-expired (signed link သေပြီ) ဖြစ်မှ throw away
     if (meta && isHardExpired(meta)) meta = null;
   }
 
-  // ───────────────────────────────────────────────
   // STEP 2: cache miss / hard-expired ဖြစ်မှသာ KV ဖတ်ပြီး resolve
   if (!meta) {
-    // ★ KV read ၂ ခုကို parallel — round-trip တစ်ခုစာ ချွေ
     const [srcUrl, customName] = await Promise.all([
       env.LINKS.get(id),
       env.LINKS.get("name:" + id),
@@ -120,8 +111,6 @@ export async function onRequest(context) {
 
     context.waitUntil(putMeta(cache, metaCacheUrl, meta, META_TTL));
   } else if (isNearExpiry(meta)) {
-    // stale-while-revalidate: ရှိပြီးသား direct နဲ့ ဆက် serve လုပ်ရင်း
-    // background မှာ link အသစ် ကြိုထုတ်ထား (နောက် request မြန်အောင်)
     context.waitUntil(
       (async () => {
         const fresh = await reResolve(env, meta);
@@ -140,7 +129,6 @@ export async function onRequest(context) {
 
   const filename = urlFilename || meta.filename || "download.mp4";
 
-  // ───────────────────────────────────────────────
   // HEAD request
   if (request.method === "HEAD") {
     let totalSize = meta.size;
@@ -169,11 +157,9 @@ export async function onRequest(context) {
     return buildHeadResponse(totalSize, filename, forceDownload);
   }
 
-  // ───────────────────────────────────────────────
-  // GET request — redirect မလုပ်ဘဲ Worker က proxy stream ပြန်ပေး
+  // GET request — proxy stream
   let upstream = await fetchUpstream(meta.direct, request, meta.srcUrl);
 
-  // signed link expired ဖြစ်ရင် source ကို ပြန် resolve ပြီး တစ်ခါ retry
   if (isUpstreamDead(upstream.status)) {
     if (upstream.body) {
       try {
@@ -194,7 +180,6 @@ export async function onRequest(context) {
     }
   }
 
-  // ★ retry ပြီးတောင် dead ဖြစ်ရင် ရှင်းရှင်း error ပြန် (error body မ pass)
   if (isUpstreamDead(upstream.status)) {
     if (upstream.body) {
       try {
@@ -237,28 +222,24 @@ export async function onRequest(context) {
     else if (upLen) respHeaders.set("Content-Length", upLen);
   }
 
-  // ★ seek (ရှေ့ကျော်/နောက်ရစ်) အတွက် မရှိမဖြစ်
   respHeaders.set("Accept-Ranges", "bytes");
   respHeaders.set("Access-Control-Allow-Origin", "*");
   respHeaders.set("Cache-Control", "no-store");
 
   applyDisposition(respHeaders, filename, forceDownload, upstream);
 
-  // ★ chunk-by-chunk pass-through — buffer မစုပ်၊ TTFB မြန် (TransformStream မလို)
   return new Response(upstream.body, {
     status: upstream.status,
     headers: respHeaders,
   });
 }
 
-// ───────────────────────────────────────────────
 // signed link expire time ဖတ်
 function getLinkExpiry(direct) {
   try {
     const u = new URL(direct);
     const sp = u.searchParams;
 
-    // AWS / S3 / R2 presigned style
     const amzDate = sp.get("X-Amz-Date");
     const amzExp = sp.get("X-Amz-Expires");
 
@@ -281,7 +262,6 @@ function getLinkExpiry(direct) {
       }
     }
 
-    // generic expiry params
     for (const key of ["expires", "Expires", "e", "exp"]) {
       const v = sp.get(key);
       if (v && /^\d{9,13}$/.test(v)) {
@@ -291,24 +271,19 @@ function getLinkExpiry(direct) {
     }
   } catch (_) {}
 
-  // exp param မပါ (qyshare / mmtube / tktube မျိုး / အမြဲသုံး link) → NOEXP_TTL (2 နာရီ)
-  // ၂ နာရီအတွင်း cache reuse ဖြစ်စေဖို့
   return Date.now() + NOEXP_TTL * 1000;
 }
 
-// hard expired — link သေသွားပြီ (60s buffer)
 function isHardExpired(meta) {
   if (!meta || !meta.expireAt) return false;
   return Date.now() >= meta.expireAt - 60_000;
 }
 
-// near expiry — 5 မိနစ်အတွင်း သေတော့မယ် → background refresh သင့်
 function isNearExpiry(meta) {
   if (!meta || !meta.expireAt) return false;
   return Date.now() >= meta.expireAt - 5 * 60_000;
 }
 
-// upstream "dead" status (link expired / not found)
 function isUpstreamDead(status) {
   return status === 403 || status === 404 || status === 410 || status === 401;
 }
@@ -345,7 +320,6 @@ async function reResolve(env, meta) {
   }
 }
 
-// ───────────────────────────────────────────────
 // upstream fetch — Range forward + proxy stream
 async function fetchUpstream(direct, request, srcUrl) {
   const fwdHeaders = new Headers();
@@ -356,7 +330,6 @@ async function fetchUpstream(direct, request, srcUrl) {
   const referer = getRefererForSource(srcUrl, direct);
   if (referer) fwdHeaders.set("Referer", referer);
 
-  // ★ seek — client ရဲ့ Range ကို တိုက်ရိုက် forward
   const range = request.headers.get("Range");
   if (range) fwdHeaders.set("Range", range);
 
@@ -493,19 +466,20 @@ function extractFilename(srcUrl, directUrl) {
   return "download.mp4";
 }
 
-// ───────────────────────────────────────────────
 // Main resolver
 async function resolveLink(srcUrl, env) {
-  // ★★ javtiful gateway link (/media/video/{id}/{quality}?expires..&signature..) ဆို
-  //    ဒါက direct မဟုတ်၊ ထပ်ဖွင့်မှ တကယ့် video ရောက်တယ် → follow လုပ်
-  if (isMediaGatewayUrl(srcUrl)) {
-    const found = await resolveMediaGateway(srcUrl, env);
-    if (found) return found;
-    // ရှာမတွေ့ရင် နောက်ဆုံးအနေနဲ့ gateway link ကိုပဲ ပြန် (browser fallback)
+  // ★★★ fast-stream.jav.si/p/{hash} direct link ဆို ထပ် resolve မလို — တန်းသုံး
+  if (isFastStreamUrl(srcUrl)) {
     return srcUrl;
   }
 
-  // ★ direct / no-exp link ဆို တန်းသုံး — network round-trip, subrequest မလို
+  // ★★ gateway link ဆို ထပ် resolve → တကယ့် video
+  if (isMediaGatewayUrl(srcUrl)) {
+    const found = await resolveMediaGateway(srcUrl, env);
+    if (found) return found;
+    return srcUrl;
+  }
+
   if (isDirectLink(srcUrl)) {
     return srcUrl;
   }
@@ -515,7 +489,6 @@ async function resolveLink(srcUrl, env) {
     if (found) return found;
   }
 
-  // ★ tktube / mmtube video page ဆို get_file link extract
   if (isTktubePageUrl(srcUrl)) {
     const found = await resolveTktube(srcUrl, env);
     if (found) return found;
@@ -524,8 +497,21 @@ async function resolveLink(srcUrl, env) {
   return await resolveGeneric(srcUrl, env);
 }
 
+// ★★★ fast-stream.jav.si/p/{hash-chain} direct video URL စစ်
+function isFastStreamUrl(u) {
+  try {
+    const url = new URL(u);
+    const host = url.hostname.toLowerCase();
+
+    const isJavSi = host === "jav.si" || host.endsWith(".jav.si");
+
+    return isJavSi && FAST_STREAM_RE.test(url.pathname);
+  } catch (_) {
+    return false;
+  }
+}
+
 // ★★ javtiful gateway URL စစ်
-//    https://javtiful.com/media/video/97481/720p?expires=..&signature=..
 function isMediaGatewayUrl(u) {
   try {
     const url = new URL(u);
@@ -540,16 +526,11 @@ function isMediaGatewayUrl(u) {
   }
 }
 
-// ★★ media gateway link ကို ဖွင့်ပြီး တကယ့် video link (R2 / storage / redirect) ဆွဲ
-//    ဒီ link ကို GET လုပ်ရင် —
-//      (a) 30x redirect နဲ့ တကယ့် storage link ကို Location မှာ ပြန် (အဖြစ်များ)
-//      (b) content-type video/* တန်းပြန် (ဒီအခါ gateway link ကိုပဲ direct သုံး)
-//      (c) HTML/JSON ထဲ video link embed (rare)
+// ★★ media gateway link ကို ဖွင့်ပြီး တကယ့် video link ဆွဲ
 async function resolveMediaGateway(gatewayUrl, env) {
   const headers = buildPageHeaders(gatewayUrl, env);
 
   headers.set("Accept", "*/*");
-  // Range 0-0 ဖြင့် — video ဆို byte အနည်းငယ်ပဲ ဆွဲ၊ redirect ဆို Location ရ
   headers.set("Range", "bytes=0-0");
 
   let currentUrl = gatewayUrl;
@@ -579,7 +560,8 @@ async function resolveMediaGateway(gatewayUrl, env) {
 
       const absLoc = new URL(loc, currentUrl).toString();
 
-      // storage / R2 / signed link ရောက်ရင် အဲဒါ direct
+      // ★★★ redirect Location က fast-stream link ဆို အဲဒါ direct
+      if (isFastStreamUrl(absLoc)) return absLoc;
       if (isDirectLink(absLoc)) return absLoc;
 
       currentUrl = absLoc;
@@ -614,6 +596,9 @@ async function resolveMediaGateway(gatewayUrl, env) {
         text = await res.text();
       } catch (_) {}
 
+      const fast = extractFastStreamLink(text, currentUrl);
+      if (fast) return fast;
+
       const gf = extractGetFileLink(text, currentUrl);
       if (gf) return gf;
 
@@ -621,6 +606,8 @@ async function resolveMediaGateway(gatewayUrl, env) {
       if (found) return found;
 
       const cands = extractCandidateUrls(text, currentUrl);
+      const fastHit = cands.find(isFastStreamUrl);
+      if (fastHit) return fastHit;
       const dHit = cands.find(isDirectLink);
       if (dHit) return dHit;
 
@@ -634,14 +621,12 @@ async function resolveMediaGateway(gatewayUrl, env) {
       break;
     }
 
-    // အခြား content-type — body ရှင်း
     if (res.body) {
       try {
         await res.body.cancel();
       } catch (_) {}
     }
 
-    // gateway URL ကို 200 နဲ့ ပြန်ပေမဲ့ content-type မသိရ → ဒီ URL ကိုပဲ သုံး
     if (res.status >= 200 && res.status < 300) {
       return currentUrl;
     }
@@ -671,8 +656,6 @@ function isTktubePageUrl(u) {
 }
 
 // ★ tktube / mmtube video page fetch → get_file link extract
-//    ဒီ site engine က function/get_video / video source ကို
-//    HTML data-attr သို့ inline JS ("video_url": "...get_file...") မှာ ထားလေ့ရှိ
 async function resolveTktube(pageUrl, env) {
   const pageHeaders = buildPageHeaders(pageUrl, env);
 
@@ -700,11 +683,9 @@ async function resolveTktube(pageUrl, env) {
     html = "";
   }
 
-  // ★ get_file link ကို HTML ကနေ တိုက်ရိုက်ရှာ (tktube/mmtube pattern)
   const gf = extractGetFileLink(html, pageUrl);
   if (gf) return gf;
 
-  // fallback — generic body extractor
   let direct = extractDirectFromBody(html, pageUrl);
   if (direct) return direct;
 
@@ -727,9 +708,28 @@ async function resolveTktube(pageUrl, env) {
   return null;
 }
 
+// ★★★ fast-stream.jav.si/p/{hash-chain} link ကို HTML/JS ကနေ ဆွဲထုတ်
+function extractFastStreamLink(text, baseUrl) {
+  if (!text) return null;
+
+  let source = String(text)
+    .replace(/\\\//g, "/")
+    .replace(/\\u0026/g, "&")
+    .replace(/&amp;/g, "&")
+    .replace(/&#038;/g, "&");
+
+  const absRe =
+    /https?:\/\/[A-Za-z0-9.\-]*jav\.si\/p\/[0-9a-f]{4,}(?:-[0-9a-f]{2,})+[^\s"'\\<>()]*/gi;
+  const abs = source.match(absRe);
+  if (abs && abs.length) {
+    const best = abs.map(cleanUrl).sort((a, b) => b.length - a.length)[0];
+    if (best) return best;
+  }
+
+  return null;
+}
+
 // ★ tktube / mmtube ရဲ့ get_file video link ကို HTML/JS ကနေ ဆွဲထုတ်
-//    "video_url": "https://.../get_file/.../....mp4/?v-acctoken=..."
-//    function/get_file/... escaped slash \/ ပါ ဖြေပြီးရှာ
 function extractGetFileLink(text, baseUrl) {
   if (!text) return null;
 
@@ -744,17 +744,14 @@ function extractGetFileLink(text, baseUrl) {
     origin = new URL(baseUrl).origin;
   } catch (_) {}
 
-  // full https get_file url
   const absRe =
     /https?:\/\/[^\s"'\\<>()]+\/get_file\/[^\s"'\\<>()]+/gi;
   const abs = source.match(absRe);
   if (abs && abs.length) {
-    // အရှည်ဆုံး (token အပြည့်ပါတဲ့) ကို ဦးစားပေး
     const best = abs.map(cleanUrl).sort((a, b) => b.length - a.length)[0];
     if (best) return best;
   }
 
-  // relative /get_file/... (origin ပေါင်း)
   if (origin) {
     const relRe = /["'](\/get_file\/[^\s"'\\<>()]+)["']/gi;
     let m;
@@ -770,7 +767,6 @@ function extractGetFileLink(text, baseUrl) {
 }
 
 // ★★ javtiful gateway link (/media/video/{id}/{quality}) ကို HTML/JS ကနေ ဆွဲထုတ်
-//    javtiful video page ထဲမှာ ဒီ gateway link ကို embed ထားလေ့ရှိ
 function extractMediaGatewayLink(text, baseUrl) {
   if (!text) return null;
 
@@ -785,7 +781,6 @@ function extractMediaGatewayLink(text, baseUrl) {
     origin = new URL(baseUrl).origin;
   } catch (_) {}
 
-  // full https /media/video/... url (expires & signature ပါတဲ့ အရှည်ဆုံးကို ဦးစားပေး)
   const absRe =
     /https?:\/\/[^\s"'\\<>()]+\/media\/video\/\d+\/[^\s"'\\<>()]+/gi;
   const abs = source.match(absRe);
@@ -794,7 +789,6 @@ function extractMediaGatewayLink(text, baseUrl) {
     if (best) return best;
   }
 
-  // relative /media/video/... (origin ပေါင်း)
   if (origin) {
     const relRe = /["'](\/media\/video\/\d+\/[^\s"'\\<>()]+)["']/gi;
     let m;
@@ -810,8 +804,9 @@ function extractMediaGatewayLink(text, baseUrl) {
 }
 
 // javtiful.com/video/... ကို fetch ပြီး video link extract
-// ★★ engine ပြောင်းသွားလို့ — gateway link (/media/video/..) ကို ဦးစားပေးရှာ၊
-//    တွေ့ရင် ထပ် resolveMediaGateway လုပ်ပြီး တကယ့် video ရအောင်
+// ★★★ (0) ဦးစားပေးဆုံး — fast-stream.jav.si/p/{hash} ရှာ (engine အသစ်)
+//    (A) မတွေ့ရင် — gateway link ရှာ → resolveMediaGateway
+//    (B) မတွေ့ရင် — R2 / storage link (engine အဟောင်း)
 async function resolveJavtiful(pageUrl, env) {
   const pageHeaders = buildPageHeaders(pageUrl, env);
 
@@ -839,20 +834,26 @@ async function resolveJavtiful(pageUrl, env) {
     html = "";
   }
 
-  // ★★ ဦးစားပေး — gateway link (/media/video/{id}/{quality}) ရှာ
+  // ★★★ (0) ဦးစားပေးဆုံး — fast-stream.jav.si/p/{hash} direct link
+  const fast = extractFastStreamLink(html, pageUrl);
+  if (fast) return fast;
+
+  // ★★ (A) gateway link ရှာ → ထပ် resolve
   const gateway = extractMediaGatewayLink(html, pageUrl);
   if (gateway) {
     const real = await resolveMediaGateway(gateway, env);
     if (real) return real;
-    // ထပ်ဖွင့်လို့ မရရင် gateway link ကိုပဲ ပြန် (browser က ဖွင့်နိုင်တယ်)
     return gateway;
   }
 
-  // legacy — တိုက်ရိုက် storage/R2 link embed ဖြစ်ကောင်းဖြစ်နိုင်
+  // ★★ (B) legacy — R2 / storage link embed
   let direct = extractDirectFromBody(html, pageUrl);
   if (direct) return direct;
 
   const candidates = extractCandidateUrls(html, pageUrl);
+
+  const fastHit = candidates.find(isFastStreamUrl);
+  if (fastHit) return fastHit;
 
   const directHit = candidates.find(isDirectLink);
   if (directHit) return directHit;
@@ -903,6 +904,7 @@ async function resolveCandidate(candidateUrl, refererUrl, env) {
       if (!loc) return null;
 
       const absLoc = new URL(loc, currentUrl).toString();
+      if (isFastStreamUrl(absLoc)) return absLoc;
       if (isDirectLink(absLoc)) return absLoc;
 
       currentUrl = absLoc;
@@ -940,6 +942,10 @@ async function resolveCandidate(candidateUrl, refererUrl, env) {
       text = "";
     }
 
+    // ★★★ fast-stream link ကို candidate response ကနေလည်း ရှာ
+    const fast = extractFastStreamLink(text, currentUrl);
+    if (fast) return fast;
+
     // ★★ gateway link ကို candidate response ကနေလည်း ရှာ
     const gw = extractMediaGatewayLink(text, currentUrl);
     if (gw) {
@@ -948,7 +954,6 @@ async function resolveCandidate(candidateUrl, refererUrl, env) {
       return gw;
     }
 
-    // ★ get_file link ကို candidate response ကနေလည်း ရှာ
     const gf = extractGetFileLink(text, currentUrl);
     if (gf) return gf;
 
@@ -966,8 +971,7 @@ async function resolveCandidate(candidateUrl, refererUrl, env) {
   return null;
 }
 
-// ───────────────────────────────────────────────
-// Generic resolver — HEAD-first redirect chain (body မဆွဲ → ပိုမြန်)
+// Generic resolver
 async function resolveGeneric(srcUrl, env) {
   const headers = buildPageHeaders(srcUrl, env);
 
@@ -1015,7 +1019,6 @@ async function resolveGeneric(srcUrl, env) {
       }
     }
 
-    // HEAD နဲ့ မရရင် GET နဲ့ body ဆွဲပြီး HTML parse
     const getRes = await fetch(currentUrl, {
       method: "GET",
       headers,
@@ -1074,7 +1077,10 @@ async function resolveGeneric(srcUrl, env) {
         bodyText = await getRes.text();
       } catch (_) {}
 
-      // ★★ gateway link ကို generic body ကနေလည်း ရှာ
+      // ★★★ fast-stream link ကို generic body ကနေလည်း ရှာ
+      const fast = extractFastStreamLink(bodyText, currentUrl);
+      if (fast) return fast;
+
       const gw = extractMediaGatewayLink(bodyText, currentUrl);
       if (gw) {
         const real = await resolveMediaGateway(gw, env);
@@ -1082,7 +1088,6 @@ async function resolveGeneric(srcUrl, env) {
         return gw;
       }
 
-      // ★ get_file link ကို generic body ကနေလည်း ရှာ
       const gf = extractGetFileLink(bodyText, currentUrl);
       if (gf) return gf;
 
@@ -1090,6 +1095,10 @@ async function resolveGeneric(srcUrl, env) {
       if (found) return found;
 
       const cands = extractCandidateUrls(bodyText, currentUrl);
+
+      const fastHit = cands.find(isFastStreamUrl);
+      if (fastHit) return fastHit;
+
       const dHit = cands.find(isDirectLink);
       if (dHit) return dHit;
 
@@ -1111,7 +1120,6 @@ async function resolveGeneric(srcUrl, env) {
   return null;
 }
 
-// ───────────────────────────────────────────────
 function buildPageHeaders(url, env) {
   const headers = new Headers();
 
@@ -1127,11 +1135,10 @@ function buildPageHeaders(url, env) {
   const referer = getRefererForSource(url);
   if (referer) headers.set("Referer", referer);
 
-  // ★★ javtiful page နဲ့ gateway link နှစ်မျိုးလုံးအတွက် cookie သုံး
   if (
     env &&
     env.JAVTIFUL_COOKIE &&
-    (isJavtifulPageUrl(url) || isMediaGatewayUrl(url))
+    (isJavtifulPageUrl(url) || isMediaGatewayUrl(url) || isFastStreamUrl(url))
   ) {
     headers.set("Cookie", env.JAVTIFUL_COOKIE);
   }
@@ -1140,7 +1147,8 @@ function buildPageHeaders(url, env) {
     env &&
     env.SITE_COOKIE &&
     !isJavtifulPageUrl(url) &&
-    !isMediaGatewayUrl(url)
+    !isMediaGatewayUrl(url) &&
+    !isFastStreamUrl(url)
   ) {
     headers.set("Cookie", env.SITE_COOKIE);
   }
@@ -1149,6 +1157,13 @@ function buildPageHeaders(url, env) {
 }
 
 function getRefererForSource(srcUrl, directUrl = "") {
+  // ★★★ fast-stream / jav.si direct link ဆို Referer ကို javtiful.com ထားပေး
+  try {
+    if (isFastStreamUrl(srcUrl) || isFastStreamUrl(directUrl)) {
+      return "https://javtiful.com/";
+    }
+  } catch (_) {}
+
   try {
     const u = new URL(srcUrl || directUrl);
     return u.origin + "/";
@@ -1179,8 +1194,10 @@ function isJavtifulPageUrl(u) {
 function isDirectLink(u) {
   if (!u) return false;
 
-  // ★★ javtiful gateway link ဆို direct မဟုတ် — ထပ် resolve လုပ်ရမယ်
-  //    (signature= ပါလို့ အောက်က rule တွေ တွေ့သွားမှာမို့ ဒီမှာ ဦးစားပေး ပယ်)
+  // ★★★ fast-stream.jav.si/p/{hash} ဆို direct
+  if (isFastStreamUrl(u)) return true;
+
+  // ★★ gateway link ဆို direct မဟုတ် — ထပ် resolve
   if (isMediaGatewayUrl(u)) return false;
 
   if (DIRECT_HOST_RE.test(u)) return true;
@@ -1188,7 +1205,6 @@ function isDirectLink(u) {
   try {
     const url = new URL(u);
 
-    // ★ /get_file/ path ဆို token check မလိုဘဲ direct (tktube/mmtube engine)
     if (/\/get_file\//i.test(url.pathname)) return true;
 
     if (
@@ -1200,7 +1216,6 @@ function isDirectLink(u) {
       return true;
     }
 
-    // ★ path ထဲမှာ .mp4/.m3u8/.ts ရှိပြီး နောက်မှာ / (get_file style) ဆို direct
     if (/\.(?:mp4|m3u8|ts)\//i.test(url.pathname)) return true;
   } catch (_) {}
 
@@ -1213,7 +1228,6 @@ function isDirectLink(u) {
     /[?&](?:expires|e|exp|signature|sign|token|hash|md5|acctoken|v-acctoken)=/i.test(
       u
     ) ||
-    // ★ .mp4/.m3u8/.ts — extension နောက်မှာ ? # / ဒါမှမဟုတ် string အဆုံး
     /\.(?:mp4|m3u8|ts)(?:[?#/]|$)/i.test(u)
   );
 }
@@ -1229,7 +1243,6 @@ function extractDirectFromBody(text, baseUrl, depth = 0) {
     .replace(/&amp;/g, "&")
     .replace(/&#038;/g, "&");
 
-  // ★ get_file (tktube/mmtube) ကို storage regex မှာ ထည့်
   const storageRe =
     /https?:\/\/[^\s"'\\<>()]+(?:(?:r2\.cloudflarestorage\.com)|(?:\.r2\.dev)|(?:cloudflarestream\.com)|(?:qyshare\.com)|(?:\/get_file\/)|(?:\.mp4)|(?:\.m3u8))[^\s"'\\<>()]*/gi;
 
@@ -1248,7 +1261,6 @@ function extractDirectFromBody(text, baseUrl, depth = 0) {
 
   const signed = source.match(signedRe);
   if (signed && signed.length) {
-    // ★★ gateway link (/media/video/..) ကို ဒီကနေ ပယ် (direct မဟုတ်)
     const cleaned = signed
       .map(cleanUrl)
       .filter((x) => x && !isMediaGatewayUrl(x))
@@ -1318,6 +1330,12 @@ function extractCandidateUrls(text, baseUrl) {
       if (seen.has(abs)) return;
       seen.add(abs);
 
+      // ★★★ fast-stream link ဆို ဦးစားပေး ထည့်
+      if (isFastStreamUrl(abs)) {
+        out.push(abs);
+        return;
+      }
+
       if (isDirectLink(abs)) {
         out.push(abs);
         return;
@@ -1327,7 +1345,6 @@ function extractCandidateUrls(text, baseUrl) {
       const p = parsed.pathname.toLowerCase();
       const q = parsed.search.toLowerCase();
 
-      // ★★ gateway link (/media/video/..) ကိုလည်း candidate အနေနဲ့ ထည့် (resolve ရန်)
       if (isMediaGatewayUrl(abs)) {
         out.push(abs);
         return;
@@ -1363,8 +1380,8 @@ function extractCandidateUrls(text, baseUrl) {
   }
 
   out.sort((a, b) => {
-    const da = isDirectLink(a) ? 0 : 1;
-    const db = isDirectLink(b) ? 0 : 1;
+    const da = isFastStreamUrl(a) ? 0 : isDirectLink(a) ? 1 : 2;
+    const db = isFastStreamUrl(b) ? 0 : isDirectLink(b) ? 1 : 2;
     return da - db;
   });
 
