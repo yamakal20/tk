@@ -1,105 +1,175 @@
 // functions/v/[[path]].js
 // /v/{id}.mp4 နှင့် /v/{id}/{filename} နှစ်မျိုးလုံး support
 //
-// ★★ ပြင်ဆင်ချက် (javtiful engine ထပ်ပြောင်း):
-//   (1) R2 link (engine အဟောင်း)
-//   (2) /media/video/{id}/{quality}?expires=..&signature=.. gateway link
-//   (3) ★★★ အသစ် — fast-stream.jav.si/p/{hash-chain} direct video link
-//       (R2/media မသုံးဘဲ page ကနေ တန်းထွက်လာတဲ့ link) — ထပ် resolve မလို၊ direct
+// Javtiful engine support:
+//   (1) Legacy R2 / storage link
+//   (2) /media/video/{id}/{quality}?expires=... gateway
+//   (3) fast-stream.jav.si/p/{hash-chain}
+//   (4) Main page မှာ source မတွေ့ရင် /embed/{videoId} fallback
+//
+// ကျန် behavior:
+//   - Code 2 ရဲ့ proxy/download behavior မပြောင်း
+//   - Range request support
+//   - HEAD size detection
+//   - tktube / mmtube support မပြောင်း
 
-const META_TTL = 3000;            // meta cache TTL = 50 မိနစ် (seconds)
-const RESOLVE_LIMIT = 8;          // redirect chain max hop
-const NOEXP_TTL = 2 * 60 * 60;    // exp မပါတဲ့ link cache = 2 နာရီ (7200s)
-const CANDIDATE_BATCH = 6;        // candidate parallel resolve batch size
-const CANDIDATE_CAP = 15;         // candidate max count
+const META_TTL = 3000;
+const RESOLVE_LIMIT = 8;
+const NOEXP_TTL = 2 * 60 * 60;
+const CANDIDATE_BATCH = 6;
+const CANDIDATE_CAP = 15;
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/120.0 Safari/537.36";
 
-// "direct video" host pattern
-// ★ tktube / mmtube (get_file engine) + ★★★ fast-stream.jav.si ကိုပါ ထည့်
 const DIRECT_HOST_RE =
   /(?:qyshare\.com|r2\.cloudflarestorage\.com|\.r2\.dev|cloudflarestream\.com|tktube\.com|mmtube\.net|fast-stream\.jav\.si|(?:^|\.)jav\.si)/i;
 
-// token-ish direct endpoint (qyshare /api/share/download?token=...&fileId=...)
 const DIRECT_PATH_RE =
   /\/(?:api\/share\/download|get_file|dl|download|stream)\b/i;
 
-// ★★ javtiful gateway link — /media/video/{id}/{quality}?expires=..&signature=..
 const MEDIA_GATEWAY_RE =
   /\/media\/video\/\d+\/[A-Za-z0-9]+/i;
 
-// ★★★ အသစ် — fast-stream.jav.si/p/{hash-chunk-chain} direct video link
 const FAST_STREAM_RE =
   /\/p\/[0-9a-f]{4,}(?:-[0-9a-f]{2,})+/i;
 
 export async function onRequest(context) {
   const { request, params, env } = context;
 
-  if (request.method !== "GET" && request.method !== "HEAD") {
-    return new Response("Method not allowed", { status: 405 });
+  if (
+    request.method !== "GET" &&
+    request.method !== "HEAD"
+  ) {
+    return new Response("Method not allowed", {
+      status: 405,
+    });
   }
 
   let segments = params.path;
-  if (typeof segments === "string") segments = [segments];
 
-  if (!Array.isArray(segments) || segments.length === 0) {
-    return new Response("Invalid path", { status: 400 });
+  if (typeof segments === "string") {
+    segments = [segments];
   }
 
-  let id = segments[0];
-  if (id.includes(".")) id = id.substring(0, id.lastIndexOf("."));
+  if (
+    !Array.isArray(segments) ||
+    segments.length === 0
+  ) {
+    return new Response("Invalid path", {
+      status: 400,
+    });
+  }
+
+  let id = String(segments[0] || "").trim();
+
+  if (id.includes(".")) {
+    id = id.substring(
+      0,
+      id.lastIndexOf(".")
+    );
+  }
+
+  if (!id) {
+    return new Response("Invalid ID", {
+      status: 400,
+    });
+  }
 
   let urlFilename = "";
+
   if (segments.length >= 2) {
-    urlFilename = decodeURIComponent(segments[segments.length - 1]);
+    try {
+      urlFilename = decodeURIComponent(
+        segments[segments.length - 1]
+      );
+    } catch (_) {
+      urlFilename =
+        segments[segments.length - 1];
+    }
   }
 
   const reqUrl = new URL(request.url);
-  const forceInline = reqUrl.searchParams.get("dl") === "0";
+
+  const forceInline =
+    reqUrl.searchParams.get("dl") === "0";
+
   const forceDownload = !forceInline;
 
   const cache = caches.default;
-  const metaCacheUrl = new URL(reqUrl.origin + "/__meta/" + id);
+
+  const metaCacheUrl = new URL(
+    reqUrl.origin +
+      "/__meta/" +
+      encodeURIComponent(id)
+  );
 
   let meta = null;
 
   // STEP 1: meta cache ဖတ်
-  const cachedMeta = await cache.match(metaCacheUrl);
+  const cachedMeta =
+    await cache.match(metaCacheUrl);
+
   if (cachedMeta) {
     try {
       meta = await cachedMeta.json();
     } catch (_) {
       meta = null;
     }
-    if (meta && isHardExpired(meta)) meta = null;
+
+    if (meta && isHardExpired(meta)) {
+      meta = null;
+    }
   }
 
-  // STEP 2: cache miss / hard-expired ဖြစ်မှသာ KV ဖတ်ပြီး resolve
+  // STEP 2: cache miss / hard-expired ဖြစ်မှ KV ဖတ်ပြီး resolve
   if (!meta) {
-    const [srcUrl, customName] = await Promise.all([
-      env.LINKS.get(id),
-      env.LINKS.get("name:" + id),
-    ]);
+    const [srcUrl, customName] =
+      await Promise.all([
+        env.LINKS.get(id),
+        env.LINKS.get("name:" + id),
+      ]);
 
     if (!srcUrl) {
-      return new Response("ID ရှာမတွေ့ပါ", { status: 404 });
+      return new Response(
+        "ID ရှာမတွေ့ပါ",
+        {
+          status: 404,
+        }
+      );
     }
 
     let direct;
+
     try {
-      direct = await resolveLink(srcUrl, env);
-    } catch (e) {
-      return new Response("Resolve error: " + e.message, { status: 502 });
+      direct = await resolveLink(
+        srcUrl,
+        env
+      );
+    } catch (error) {
+      return new Response(
+        "Resolve error: " +
+          getErrorMessage(error),
+        {
+          status: 502,
+        }
+      );
     }
 
     if (!direct) {
-      return new Response("Direct link ရှာမတွေ့ပါ", { status: 502 });
+      return new Response(
+        "Direct link ရှာမတွေ့ပါ",
+        {
+          status: 502,
+        }
+      );
     }
 
     const filename =
-      urlFilename || customName || extractFilename(srcUrl, direct);
+      urlFilename ||
+      customName ||
+      extractFilename(srcUrl, direct);
 
     meta = {
       srcUrl,
@@ -109,40 +179,77 @@ export async function onRequest(context) {
       expireAt: getLinkExpiry(direct),
     };
 
-    context.waitUntil(putMeta(cache, metaCacheUrl, meta, META_TTL));
+    context.waitUntil(
+      putMeta(
+        cache,
+        metaCacheUrl,
+        meta,
+        META_TTL
+      )
+    );
   } else if (isNearExpiry(meta)) {
     context.waitUntil(
       (async () => {
-        const fresh = await reResolve(env, meta);
-        if (fresh) {
-          const m2 = {
-            ...meta,
-            direct: fresh,
-            expireAt: getLinkExpiry(fresh),
-            size: null,
-          };
-          await putMeta(cache, metaCacheUrl, m2, META_TTL);
-        }
+        const fresh =
+          await reResolve(env, meta);
+
+        if (!fresh) return;
+
+        const freshMeta = {
+          ...meta,
+          direct: fresh,
+          expireAt: getLinkExpiry(fresh),
+          size: null,
+        };
+
+        await putMeta(
+          cache,
+          metaCacheUrl,
+          freshMeta,
+          META_TTL
+        );
       })()
     );
   }
 
-  const filename = urlFilename || meta.filename || "download.mp4";
+  const filename =
+    urlFilename ||
+    meta.filename ||
+    "download.mp4";
 
   // HEAD request
   if (request.method === "HEAD") {
     let totalSize = meta.size;
 
     if (!totalSize) {
-      let headUp = await fetchHeadSize(meta.direct, meta.srcUrl);
+      let headUp = await fetchHeadSize(
+        meta.direct,
+        meta.srcUrl
+      );
 
       if (headUp.expired) {
-        const fresh = await reResolve(env, meta);
+        const fresh =
+          await reResolve(env, meta);
+
         if (fresh) {
           meta.direct = fresh;
-          meta.expireAt = getLinkExpiry(fresh);
-          context.waitUntil(putMeta(cache, metaCacheUrl, meta, META_TTL));
-          headUp = await fetchHeadSize(meta.direct, meta.srcUrl);
+          meta.expireAt =
+            getLinkExpiry(fresh);
+          meta.size = null;
+
+          context.waitUntil(
+            putMeta(
+              cache,
+              metaCacheUrl,
+              meta,
+              META_TTL
+            )
+          );
+
+          headUp = await fetchHeadSize(
+            meta.direct,
+            meta.srcUrl
+          );
         }
       }
 
@@ -150,15 +257,31 @@ export async function onRequest(context) {
 
       if (totalSize) {
         meta.size = totalSize;
-        context.waitUntil(putMeta(cache, metaCacheUrl, meta, META_TTL));
+
+        context.waitUntil(
+          putMeta(
+            cache,
+            metaCacheUrl,
+            meta,
+            META_TTL
+          )
+        );
       }
     }
 
-    return buildHeadResponse(totalSize, filename, forceDownload);
+    return buildHeadResponse(
+      totalSize,
+      filename,
+      forceDownload
+    );
   }
 
   // GET request — proxy stream
-  let upstream = await fetchUpstream(meta.direct, request, meta.srcUrl);
+  let upstream = await fetchUpstream(
+    meta.direct,
+    request,
+    meta.srcUrl
+  );
 
   if (isUpstreamDead(upstream.status)) {
     if (upstream.body) {
@@ -167,16 +290,29 @@ export async function onRequest(context) {
       } catch (_) {}
     }
 
-    const fresh = await reResolve(env, meta);
+    const fresh =
+      await reResolve(env, meta);
 
     if (fresh) {
       meta.direct = fresh;
-      meta.expireAt = getLinkExpiry(fresh);
+      meta.expireAt =
+        getLinkExpiry(fresh);
       meta.size = null;
 
-      context.waitUntil(putMeta(cache, metaCacheUrl, meta, META_TTL));
+      context.waitUntil(
+        putMeta(
+          cache,
+          metaCacheUrl,
+          meta,
+          META_TTL
+        )
+      );
 
-      upstream = await fetchUpstream(meta.direct, request, meta.srcUrl);
+      upstream = await fetchUpstream(
+        meta.direct,
+        request,
+        meta.srcUrl
+      );
     }
   }
 
@@ -186,47 +322,117 @@ export async function onRequest(context) {
         await upstream.body.cancel();
       } catch (_) {}
     }
-    return new Response("Upstream unavailable (" + upstream.status + ")", {
-      status: 502,
-      headers: { "Access-Control-Allow-Origin": "*" },
-    });
+
+    return new Response(
+      "Upstream unavailable (" +
+        upstream.status +
+        ")",
+      {
+        status: 502,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+        },
+      }
+    );
   }
 
   const respHeaders = new Headers();
 
-  const upLen = upstream.headers.get("content-length");
-  const upRange = upstream.headers.get("content-range");
+  const upLen =
+    upstream.headers.get(
+      "content-length"
+    );
 
-  for (const h of ["content-range", "last-modified", "etag"]) {
-    const v = upstream.headers.get(h);
-    if (v) respHeaders.set(h, v);
+  const upRange =
+    upstream.headers.get(
+      "content-range"
+    );
+
+  for (const headerName of [
+    "content-range",
+    "last-modified",
+    "etag",
+  ]) {
+    const value =
+      upstream.headers.get(headerName);
+
+    if (value) {
+      respHeaders.set(
+        headerName,
+        value
+      );
+    }
   }
 
   let totalSize = null;
+
   if (upRange) {
-    const m = upRange.match(/\/(\d+)\s*$/);
-    if (m) totalSize = m[1];
+    const match =
+      upRange.match(/\/(\d+)\s*$/);
+
+    if (match) {
+      totalSize = match[1];
+    }
   }
 
   if (totalSize && !meta.size) {
     meta.size = totalSize;
-    context.waitUntil(putMeta(cache, metaCacheUrl, meta, META_TTL));
+
+    context.waitUntil(
+      putMeta(
+        cache,
+        metaCacheUrl,
+        meta,
+        META_TTL
+      )
+    );
   }
 
-  const reqHasRange = !!request.headers.get("Range");
+  const reqHasRange =
+    !!request.headers.get("Range");
 
   if (reqHasRange) {
-    if (upLen) respHeaders.set("Content-Length", upLen);
+    if (upLen) {
+      respHeaders.set(
+        "Content-Length",
+        upLen
+      );
+    }
   } else {
-    if (totalSize) respHeaders.set("Content-Length", totalSize);
-    else if (upLen) respHeaders.set("Content-Length", upLen);
+    if (totalSize) {
+      respHeaders.set(
+        "Content-Length",
+        totalSize
+      );
+    } else if (upLen) {
+      respHeaders.set(
+        "Content-Length",
+        upLen
+      );
+    }
   }
 
-  respHeaders.set("Accept-Ranges", "bytes");
-  respHeaders.set("Access-Control-Allow-Origin", "*");
-  respHeaders.set("Cache-Control", "no-store");
+  respHeaders.set(
+    "Accept-Ranges",
+    "bytes"
+  );
 
-  applyDisposition(respHeaders, filename, forceDownload, upstream);
+  respHeaders.set(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
+
+  respHeaders.set(
+    "Cache-Control",
+    "no-store"
+  );
+
+  applyDisposition(
+    respHeaders,
+    filename,
+    forceDownload,
+    upstream
+  );
 
   return new Response(upstream.body, {
     status: upstream.status,
@@ -237,83 +443,153 @@ export async function onRequest(context) {
 // signed link expire time ဖတ်
 function getLinkExpiry(direct) {
   try {
-    const u = new URL(direct);
-    const sp = u.searchParams;
+    const url = new URL(direct);
+    const searchParams =
+      url.searchParams;
 
-    const amzDate = sp.get("X-Amz-Date");
-    const amzExp = sp.get("X-Amz-Expires");
+    const amzDate =
+      searchParams.get("X-Amz-Date");
 
-    if (amzDate && amzExp) {
-      const m = amzDate.match(
+    const amzExpires =
+      searchParams.get(
+        "X-Amz-Expires"
+      );
+
+    if (amzDate && amzExpires) {
+      const match = amzDate.match(
         /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/
       );
 
-      if (m) {
+      if (match) {
         const issued = Date.UTC(
-          +m[1],
-          +m[2] - 1,
-          +m[3],
-          +m[4],
-          +m[5],
-          +m[6]
+          Number(match[1]),
+          Number(match[2]) - 1,
+          Number(match[3]),
+          Number(match[4]),
+          Number(match[5]),
+          Number(match[6])
         );
 
-        return issued + parseInt(amzExp, 10) * 1000;
+        return (
+          issued +
+          parseInt(amzExpires, 10) *
+            1000
+        );
       }
     }
 
-    for (const key of ["expires", "Expires", "e", "exp"]) {
-      const v = sp.get(key);
-      if (v && /^\d{9,13}$/.test(v)) {
-        const n = parseInt(v, 10);
-        return v.length <= 10 ? n * 1000 : n;
+    for (const key of [
+      "expires",
+      "Expires",
+      "e",
+      "exp",
+    ]) {
+      const value =
+        searchParams.get(key);
+
+      if (
+        value &&
+        /^\d{9,13}$/.test(value)
+      ) {
+        const expiry =
+          parseInt(value, 10);
+
+        return value.length <= 10
+          ? expiry * 1000
+          : expiry;
       }
     }
   } catch (_) {}
 
-  return Date.now() + NOEXP_TTL * 1000;
+  return (
+    Date.now() +
+    NOEXP_TTL * 1000
+  );
 }
 
 function isHardExpired(meta) {
-  if (!meta || !meta.expireAt) return false;
-  return Date.now() >= meta.expireAt - 60_000;
+  if (!meta || !meta.expireAt) {
+    return false;
+  }
+
+  return (
+    Date.now() >=
+    meta.expireAt - 60_000
+  );
 }
 
 function isNearExpiry(meta) {
-  if (!meta || !meta.expireAt) return false;
-  return Date.now() >= meta.expireAt - 5 * 60_000;
+  if (!meta || !meta.expireAt) {
+    return false;
+  }
+
+  return (
+    Date.now() >=
+    meta.expireAt - 5 * 60_000
+  );
 }
 
 function isUpstreamDead(status) {
-  return status === 403 || status === 404 || status === 410 || status === 401;
+  return (
+    status === 403 ||
+    status === 404 ||
+    status === 410 ||
+    status === 401
+  );
 }
 
-async function putMeta(cache, metaCacheUrl, meta, ttl) {
+async function putMeta(
+  cache,
+  metaCacheUrl,
+  meta,
+  ttl
+) {
   try {
     let effectiveTtl = ttl;
 
     if (meta.expireAt) {
-      const remain = Math.floor((meta.expireAt - Date.now()) / 1000);
-      if (remain > 0 && remain < effectiveTtl) effectiveTtl = remain;
+      const remaining = Math.floor(
+        (meta.expireAt - Date.now()) /
+          1000
+      );
+
+      if (
+        remaining > 0 &&
+        remaining < effectiveTtl
+      ) {
+        effectiveTtl = remaining;
+      }
     }
 
-    if (effectiveTtl < 1) effectiveTtl = 1;
+    if (effectiveTtl < 1) {
+      effectiveTtl = 1;
+    }
 
     await cache.put(
       metaCacheUrl,
-      new Response(JSON.stringify(meta), {
-        headers: {
-          "Content-Type": "application/json",
-          "Cache-Control": "max-age=" + effectiveTtl,
-        },
-      })
+      new Response(
+        JSON.stringify(meta),
+        {
+          headers: {
+            "Content-Type":
+              "application/json",
+            "Cache-Control":
+              "max-age=" +
+              effectiveTtl,
+          },
+        }
+      )
     );
   } catch (_) {}
 }
 
 async function reResolve(env, meta) {
   try {
-    const fresh = await resolveLink(meta.srcUrl, env);
+    const fresh = await resolveLink(
+      meta.srcUrl,
+      env
+    );
+
     return fresh || null;
   } catch (_) {
     return null;
@@ -321,17 +597,45 @@ async function reResolve(env, meta) {
 }
 
 // upstream fetch — Range forward + proxy stream
-async function fetchUpstream(direct, request, srcUrl) {
+async function fetchUpstream(
+  direct,
+  request,
+  srcUrl
+) {
   const fwdHeaders = new Headers();
 
-  fwdHeaders.set("User-Agent", UA);
-  fwdHeaders.set("Accept", "*/*");
+  fwdHeaders.set(
+    "User-Agent",
+    UA
+  );
 
-  const referer = getRefererForSource(srcUrl, direct);
-  if (referer) fwdHeaders.set("Referer", referer);
+  fwdHeaders.set(
+    "Accept",
+    "*/*"
+  );
 
-  const range = request.headers.get("Range");
-  if (range) fwdHeaders.set("Range", range);
+  const referer =
+    getRefererForSource(
+      srcUrl,
+      direct
+    );
+
+  if (referer) {
+    fwdHeaders.set(
+      "Referer",
+      referer
+    );
+  }
+
+  const range =
+    request.headers.get("Range");
+
+  if (range) {
+    fwdHeaders.set(
+      "Range",
+      range
+    );
+  }
 
   return fetch(direct, {
     method: "GET",
@@ -340,114 +644,263 @@ async function fetchUpstream(direct, request, srcUrl) {
   });
 }
 
-async function fetchHeadSize(direct, srcUrl) {
+async function fetchHeadSize(
+  direct,
+  srcUrl
+) {
   const fwdHeaders = new Headers();
 
-  fwdHeaders.set("User-Agent", UA);
-  fwdHeaders.set("Accept", "*/*");
-  fwdHeaders.set("Range", "bytes=0-0");
+  fwdHeaders.set(
+    "User-Agent",
+    UA
+  );
 
-  const referer = getRefererForSource(srcUrl, direct);
-  if (referer) fwdHeaders.set("Referer", referer);
+  fwdHeaders.set(
+    "Accept",
+    "*/*"
+  );
 
-  const res = await fetch(direct, {
-    method: "GET",
-    headers: fwdHeaders,
-    redirect: "follow",
-  });
+  fwdHeaders.set(
+    "Range",
+    "bytes=0-0"
+  );
 
-  if (res.body) {
+  const referer =
+    getRefererForSource(
+      srcUrl,
+      direct
+    );
+
+  if (referer) {
+    fwdHeaders.set(
+      "Referer",
+      referer
+    );
+  }
+
+  const response = await fetch(
+    direct,
+    {
+      method: "GET",
+      headers: fwdHeaders,
+      redirect: "follow",
+    }
+  );
+
+  if (response.body) {
     try {
-      await res.body.cancel();
+      await response.body.cancel();
     } catch (_) {}
   }
 
-  if (isUpstreamDead(res.status)) {
-    return { expired: true, size: null };
+  if (
+    isUpstreamDead(response.status)
+  ) {
+    return {
+      expired: true,
+      size: null,
+    };
   }
 
   let size = null;
 
-  const cr = res.headers.get("content-range");
-  if (cr) {
-    const m = cr.match(/\/(\d+)\s*$/);
-    if (m) size = m[1];
+  const contentRange =
+    response.headers.get(
+      "content-range"
+    );
+
+  if (contentRange) {
+    const match =
+      contentRange.match(
+        /\/(\d+)\s*$/
+      );
+
+    if (match) {
+      size = match[1];
+    }
   }
 
   if (!size) {
-    const cl = res.headers.get("content-length");
-    if (cl && cl !== "1") size = cl;
-  }
+    const contentLength =
+      response.headers.get(
+        "content-length"
+      );
 
-  return { expired: false, size };
-}
-
-function buildHeadResponse(totalSize, filename, forceDownload) {
-  const h = new Headers();
-
-  h.set("Access-Control-Allow-Origin", "*");
-  h.set("Accept-Ranges", "bytes");
-
-  if (totalSize) h.set("Content-Length", totalSize);
-
-  applyDisposition(h, filename, forceDownload, null);
-
-  return new Response(null, { status: 200, headers: h });
-}
-
-function applyDisposition(headers, filename, forceDownload, upstream) {
-  if (forceDownload) {
-    headers.set("Content-Type", "application/octet-stream");
-    headers.set(
-      "Content-Disposition",
-      `attachment; filename="${sanitizeAscii(filename)}"; ` +
-        `filename*=UTF-8''${encodeURIComponent(filename)}`
-    );
-  } else {
-    let ctype = "video/mp4";
-
-    if (upstream) {
-      const ut = upstream.headers.get("content-type");
-      if (ut && (ut.startsWith("video/") || ut.includes("mpegurl"))) {
-        ctype = ut;
-      }
+    if (
+      contentLength &&
+      contentLength !== "1"
+    ) {
+      size = contentLength;
     }
+  }
 
-    headers.set("Content-Type", ctype);
+  return {
+    expired: false,
+    size,
+  };
+}
+
+function buildHeadResponse(
+  totalSize,
+  filename,
+  forceDownload
+) {
+  const headers = new Headers();
+
+  headers.set(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
+
+  headers.set(
+    "Accept-Ranges",
+    "bytes"
+  );
+
+  if (totalSize) {
     headers.set(
-      "Content-Disposition",
-      `inline; filename="${sanitizeAscii(filename)}"; ` +
-        `filename*=UTF-8''${encodeURIComponent(filename)}`
+      "Content-Length",
+      totalSize
     );
   }
+
+  applyDisposition(
+    headers,
+    filename,
+    forceDownload,
+    null
+  );
+
+  return new Response(null, {
+    status: 200,
+    headers,
+  });
+}
+
+function applyDisposition(
+  headers,
+  filename,
+  forceDownload,
+  upstream
+) {
+  if (forceDownload) {
+    headers.set(
+      "Content-Type",
+      "application/octet-stream"
+    );
+
+    headers.set(
+      "Content-Disposition",
+      `attachment; filename="${sanitizeAscii(
+        filename
+      )}"; ` +
+        `filename*=UTF-8''${encodeURIComponent(
+          filename
+        )}`
+    );
+
+    return;
+  }
+
+  let contentType = "video/mp4";
+
+  if (upstream) {
+    const upstreamType =
+      upstream.headers.get(
+        "content-type"
+      );
+
+    if (
+      upstreamType &&
+      (
+        upstreamType.startsWith(
+          "video/"
+        ) ||
+        upstreamType.includes(
+          "mpegurl"
+        )
+      )
+    ) {
+      contentType = upstreamType;
+    }
+  }
+
+  headers.set(
+    "Content-Type",
+    contentType
+  );
+
+  headers.set(
+    "Content-Disposition",
+    `inline; filename="${sanitizeAscii(
+      filename
+    )}"; ` +
+      `filename*=UTF-8''${encodeURIComponent(
+        filename
+      )}`
+  );
 }
 
 function sanitizeAscii(name) {
-  return String(name || "download.mp4")
-    .replace(/["\\\r\n]/g, "_")
-    .replace(/[^\x20-\x7E]/g, "_");
+  return String(
+    name || "download.mp4"
+  )
+    .replace(
+      /["\\\r\n]/g,
+      "_"
+    )
+    .replace(
+      /[^\x20-\x7E]/g,
+      "_"
+    );
 }
 
 function safeFileName(name) {
-  name = String(name || "").trim();
-  name = name.replace(/[\/\\?%*:|"<>]/g, "_");
-  name = name.replace(/\s+/g, "_");
+  name = String(
+    name || ""
+  ).trim();
 
-  if (!name) name = "download.mp4";
-  if (!name.includes(".")) name += ".mp4";
+  name = name.replace(
+    /[\/\\?%*:|"<>]/g,
+    "_"
+  );
+
+  name = name.replace(
+    /\s+/g,
+    "_"
+  );
+
+  if (!name) {
+    name = "download.mp4";
+  }
+
+  if (!name.includes(".")) {
+    name += ".mp4";
+  }
 
   return name;
 }
 
-function extractFilename(srcUrl, directUrl) {
+function extractFilename(
+  srcUrl,
+  directUrl
+) {
   try {
-    const src = new URL(srcUrl);
-    const parts = src.pathname.split("/").filter(Boolean);
-    let last = decodeURIComponent(parts[parts.length - 1] || "");
+    const source = new URL(srcUrl);
+
+    const parts = source.pathname
+      .split("/")
+      .filter(Boolean);
+
+    const last = decodeURIComponent(
+      parts[parts.length - 1] || ""
+    );
 
     if (
       last &&
-      !/^(?:test|index|get_file|download|play|stream)\.\w+$/i.test(last) &&
+      !/^(?:test|index|get_file|download|play|stream)\.\w+$/i.test(
+        last
+      ) &&
       last.includes(".")
     ) {
       return safeFileName(last);
@@ -455,10 +908,22 @@ function extractFilename(srcUrl, directUrl) {
   } catch (_) {}
 
   try {
-    const dParts = new URL(directUrl).pathname.split("/").filter(Boolean);
-    let last = decodeURIComponent(dParts[dParts.length - 1] || "");
+    const direct = new URL(
+      directUrl
+    );
 
-    if (last && last.includes(".")) {
+    const parts = direct.pathname
+      .split("/")
+      .filter(Boolean);
+
+    const last = decodeURIComponent(
+      parts[parts.length - 1] || ""
+    );
+
+    if (
+      last &&
+      last.includes(".")
+    ) {
       return safeFileName(last);
     }
   } catch (_) {}
@@ -466,17 +931,31 @@ function extractFilename(srcUrl, directUrl) {
   return "download.mp4";
 }
 
+// ─────────────────────────────────────────────
 // Main resolver
-async function resolveLink(srcUrl, env) {
-  // ★★★ fast-stream.jav.si/p/{hash} direct link ဆို ထပ် resolve မလို — တန်းသုံး
+// ─────────────────────────────────────────────
+
+async function resolveLink(
+  srcUrl,
+  env
+) {
+  // fast-stream direct
   if (isFastStreamUrl(srcUrl)) {
     return srcUrl;
   }
 
-  // ★★ gateway link ဆို ထပ် resolve → တကယ့် video
+  // gateway link ကို Code 2 behavior အတိုင်း resolve
   if (isMediaGatewayUrl(srcUrl)) {
-    const found = await resolveMediaGateway(srcUrl, env);
-    if (found) return found;
+    const found =
+      await resolveMediaGateway(
+        srcUrl,
+        env
+      );
+
+    if (found) {
+      return found;
+    }
+
     return srcUrl;
   }
 
@@ -485,149 +964,447 @@ async function resolveLink(srcUrl, env) {
   }
 
   if (isJavtifulPageUrl(srcUrl)) {
-    const found = await resolveJavtiful(srcUrl, env);
-    if (found) return found;
+    const found =
+      await resolveJavtiful(
+        srcUrl,
+        env
+      );
+
+    if (found) {
+      return found;
+    }
   }
 
   if (isTktubePageUrl(srcUrl)) {
-    const found = await resolveTktube(srcUrl, env);
-    if (found) return found;
+    const found =
+      await resolveTktube(
+        srcUrl,
+        env
+      );
+
+    if (found) {
+      return found;
+    }
   }
 
-  return await resolveGeneric(srcUrl, env);
+  return resolveGeneric(
+    srcUrl,
+    env
+  );
 }
 
-// ★★★ fast-stream.jav.si/p/{hash-chain} direct video URL စစ်
-function isFastStreamUrl(u) {
+function isFastStreamUrl(value) {
   try {
-    const url = new URL(u);
-    const host = url.hostname.toLowerCase();
+    const url = new URL(value);
 
-    const isJavSi = host === "jav.si" || host.endsWith(".jav.si");
+    const host =
+      url.hostname.toLowerCase();
 
-    return isJavSi && FAST_STREAM_RE.test(url.pathname);
+    const isJavSi =
+      host === "jav.si" ||
+      host.endsWith(".jav.si");
+
+    return (
+      isJavSi &&
+      FAST_STREAM_RE.test(
+        url.pathname
+      )
+    );
   } catch (_) {
     return false;
   }
 }
 
-// ★★ javtiful gateway URL စစ်
-function isMediaGatewayUrl(u) {
+function isMediaGatewayUrl(value) {
   try {
-    const url = new URL(u);
-    const host = url.hostname.toLowerCase();
+    const url = new URL(value);
 
-    const isJav =
-      host === "javtiful.com" || host.endsWith(".javtiful.com");
+    const host =
+      url.hostname.toLowerCase();
 
-    return isJav && MEDIA_GATEWAY_RE.test(url.pathname);
+    const isJavtiful =
+      host === "javtiful.com" ||
+      host.endsWith(
+        ".javtiful.com"
+      );
+
+    return (
+      isJavtiful &&
+      MEDIA_GATEWAY_RE.test(
+        url.pathname
+      )
+    );
   } catch (_) {
     return false;
   }
 }
 
-// ★★ media gateway link ကို ဖွင့်ပြီး တကယ့် video link ဆွဲ
-async function resolveMediaGateway(gatewayUrl, env) {
-  const headers = buildPageHeaders(gatewayUrl, env);
+function isJavtifulPageUrl(value) {
+  try {
+    const url = new URL(value);
 
-  headers.set("Accept", "*/*");
-  headers.set("Range", "bytes=0-0");
+    const host =
+      url.hostname.toLowerCase();
+
+    const isJavtiful =
+      host === "javtiful.com" ||
+      host.endsWith(
+        ".javtiful.com"
+      );
+
+    return (
+      isJavtiful &&
+      /^\/(?:[a-z]{2}\/)?video\/\d+(?:\/|$)/i.test(
+        url.pathname
+      )
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
+// Javtiful embed URL စစ်
+function isJavtifulEmbedUrl(value) {
+  try {
+    const url = new URL(value);
+
+    const host =
+      url.hostname.toLowerCase();
+
+    const isJavtiful =
+      host === "javtiful.com" ||
+      host.endsWith(
+        ".javtiful.com"
+      );
+
+    return (
+      isJavtiful &&
+      /^\/(?:[a-z]{2}\/)?embed\/\d+(?:\/|$)/i.test(
+        url.pathname
+      )
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
+// /video/{id}/... ကနေ /embed/{id} ဆောက်
+function getJavtifulEmbedUrl(
+  pageUrl
+) {
+  try {
+    const url = new URL(pageUrl);
+
+    const match =
+      url.pathname.match(
+        /^\/(?:[a-z]{2}\/)?video\/(\d+)(?:\/|$)/i
+      );
+
+    if (!match) {
+      return null;
+    }
+
+    return (
+      url.origin +
+      "/embed/" +
+      encodeURIComponent(match[1])
+    );
+  } catch (_) {
+    return null;
+  }
+}
+
+// Javtiful embed page fetch
+async function fetchJavtifulEmbed(
+  embedUrl,
+  pageUrl,
+  env
+) {
+  if (!embedUrl) {
+    return "";
+  }
+
+  const headers =
+    buildPageHeaders(
+      pageUrl,
+      env
+    );
+
+  headers.set(
+    "Referer",
+    pageUrl
+  );
+
+  headers.set(
+    "Accept",
+    "text/html,application/xhtml+xml,application/json,text/plain,*/*"
+  );
+
+  try {
+    const response = await fetch(
+      embedUrl,
+      {
+        method: "GET",
+        headers,
+        redirect: "follow",
+      }
+    );
+
+    const contentType = (
+      response.headers.get(
+        "content-type"
+      ) || ""
+    ).toLowerCase();
+
+    if (
+      !contentType.includes("text") &&
+      !contentType.includes("json") &&
+      !contentType.includes(
+        "javascript"
+      ) &&
+      !contentType.includes("html")
+    ) {
+      if (response.body) {
+        try {
+          await response.body.cancel();
+        } catch (_) {}
+      }
+
+      return "";
+    }
+
+    return await response.text();
+  } catch (_) {
+    return "";
+  }
+}
+
+// media gateway link ကို ဖွင့်ပြီး တကယ့် video link ဆွဲ
+async function resolveMediaGateway(
+  gatewayUrl,
+  env
+) {
+  const headers =
+    buildPageHeaders(
+      gatewayUrl,
+      env
+    );
+
+  headers.set(
+    "Accept",
+    "*/*"
+  );
+
+  headers.set(
+    "Range",
+    "bytes=0-0"
+  );
 
   let currentUrl = gatewayUrl;
 
-  for (let i = 0; i < RESOLVE_LIMIT; i++) {
-    let res;
+  for (
+    let index = 0;
+    index < RESOLVE_LIMIT;
+    index++
+  ) {
+    let response;
+
     try {
-      res = await fetch(currentUrl, {
-        method: "GET",
-        headers,
-        redirect: "manual",
-      });
+      response = await fetch(
+        currentUrl,
+        {
+          method: "GET",
+          headers,
+          redirect: "manual",
+        }
+      );
     } catch (_) {
       return null;
     }
 
-    // (a) redirect → Location ကို follow
-    if (res.status >= 300 && res.status < 400) {
-      if (res.body) {
+    if (
+      response.status >= 300 &&
+      response.status < 400
+    ) {
+      if (response.body) {
         try {
-          await res.body.cancel();
+          await response.body.cancel();
         } catch (_) {}
       }
 
-      const loc = res.headers.get("Location");
-      if (!loc) break;
+      const location =
+        response.headers.get(
+          "Location"
+        );
 
-      const absLoc = new URL(loc, currentUrl).toString();
+      if (!location) {
+        break;
+      }
 
-      // ★★★ redirect Location က fast-stream link ဆို အဲဒါ direct
-      if (isFastStreamUrl(absLoc)) return absLoc;
-      if (isDirectLink(absLoc)) return absLoc;
+      const absoluteLocation =
+        new URL(
+          location,
+          currentUrl
+        ).toString();
 
-      currentUrl = absLoc;
+      if (
+        isFastStreamUrl(
+          absoluteLocation
+        )
+      ) {
+        return absoluteLocation;
+      }
+
+      if (
+        isDirectLink(
+          absoluteLocation
+        )
+      ) {
+        return absoluteLocation;
+      }
+
+      currentUrl =
+        absoluteLocation;
+
       continue;
     }
 
-    const ct = (res.headers.get("content-type") || "").toLowerCase();
+    const contentType = (
+      response.headers.get(
+        "content-type"
+      ) || ""
+    ).toLowerCase();
 
-    // (b) video content တန်းပြန်လာ → ဒီ URL ကိုပဲ direct အဖြစ်သုံး
     if (
-      ct.startsWith("video/") ||
-      ct.includes("mpegurl") ||
-      ct.startsWith("application/octet-stream")
+      contentType.startsWith(
+        "video/"
+      ) ||
+      contentType.includes(
+        "mpegurl"
+      ) ||
+      contentType.startsWith(
+        "application/octet-stream"
+      )
     ) {
-      if (res.body) {
+      if (response.body) {
         try {
-          await res.body.cancel();
+          await response.body.cancel();
         } catch (_) {}
       }
+
       return currentUrl;
     }
 
-    // (c) HTML / JSON ထဲက video link ရှာ
     if (
-      ct.includes("text/html") ||
-      ct.includes("json") ||
-      ct.includes("javascript") ||
-      ct.includes("text/plain")
+      contentType.includes(
+        "text/html"
+      ) ||
+      contentType.includes("json") ||
+      contentType.includes(
+        "javascript"
+      ) ||
+      contentType.includes(
+        "text/plain"
+      )
     ) {
       let text = "";
+
       try {
-        text = await res.text();
-      } catch (_) {}
+        text =
+          await response.text();
+      } catch (_) {
+        text = "";
+      }
 
-      const fast = extractFastStreamLink(text, currentUrl);
-      if (fast) return fast;
-
-      const gf = extractGetFileLink(text, currentUrl);
-      if (gf) return gf;
-
-      const found = extractDirectFromBody(text, currentUrl);
-      if (found) return found;
-
-      const cands = extractCandidateUrls(text, currentUrl);
-      const fastHit = cands.find(isFastStreamUrl);
-      if (fastHit) return fastHit;
-      const dHit = cands.find(isDirectLink);
-      if (dHit) return dHit;
-
-      for (let j = 0; j < cands.length && j < CANDIDATE_BATCH; j++) {
-        const r = await resolveCandidate(cands[j], currentUrl, env).catch(
-          () => null
+      const fast =
+        extractFastStreamLink(
+          text,
+          currentUrl
         );
-        if (r) return r;
+
+      if (fast) {
+        return fast;
+      }
+
+      const getFile =
+        extractGetFileLink(
+          text,
+          currentUrl
+        );
+
+      if (getFile) {
+        return getFile;
+      }
+
+      const direct =
+        extractDirectFromBody(
+          text,
+          currentUrl
+        );
+
+      if (direct) {
+        return direct;
+      }
+
+      const candidates =
+        extractCandidateUrls(
+          text,
+          currentUrl
+        );
+
+      const fastHit =
+        candidates.find(
+          isFastStreamUrl
+        );
+
+      if (fastHit) {
+        return fastHit;
+      }
+
+      const directHit =
+        candidates.find(
+          isDirectLink
+        );
+
+      if (directHit) {
+        return directHit;
+      }
+
+      for (
+        let candidateIndex = 0;
+        candidateIndex <
+          candidates.length &&
+        candidateIndex <
+          CANDIDATE_BATCH;
+        candidateIndex++
+      ) {
+        const found =
+          await resolveCandidate(
+            candidates[
+              candidateIndex
+            ],
+            currentUrl,
+            env
+          ).catch(() => null);
+
+        if (found) {
+          return found;
+        }
       }
 
       break;
     }
 
-    if (res.body) {
+    if (response.body) {
       try {
-        await res.body.cancel();
+        await response.body.cancel();
       } catch (_) {}
     }
 
-    if (res.status >= 200 && res.status < 300) {
+    if (
+      response.status >= 200 &&
+      response.status < 300
+    ) {
       return currentUrl;
     }
 
@@ -637,332 +1414,992 @@ async function resolveMediaGateway(gatewayUrl, env) {
   return null;
 }
 
-// ★ tktube.com / mmtube.net video page URL စစ်
-function isTktubePageUrl(u) {
+// tktube.com / mmtube.net video page URL စစ်
+function isTktubePageUrl(value) {
   try {
-    const url = new URL(u);
-    const host = url.hostname.toLowerCase();
+    const url = new URL(value);
 
-    const isTk =
+    const host =
+      url.hostname.toLowerCase();
+
+    const isTktube =
       host === "tktube.com" ||
-      host.endsWith(".tktube.com") ||
+      host.endsWith(
+        ".tktube.com"
+      ) ||
       host === "mmtube.net" ||
-      host.endsWith(".mmtube.net");
+      host.endsWith(
+        ".mmtube.net"
+      );
 
-    return isTk && /^\/video\/\d+\//i.test(url.pathname);
+    return (
+      isTktube &&
+      /^\/video\/\d+\//i.test(
+        url.pathname
+      )
+    );
   } catch (_) {
     return false;
   }
 }
 
-// ★ tktube / mmtube video page fetch → get_file link extract
-async function resolveTktube(pageUrl, env) {
-  const pageHeaders = buildPageHeaders(pageUrl, env);
-
-  const res = await fetch(pageUrl, {
-    method: "GET",
-    headers: pageHeaders,
-    redirect: "follow",
-  });
-
-  const ct = (res.headers.get("content-type") || "").toLowerCase();
-
-  if (ct.startsWith("video/") || ct.startsWith("application/octet-stream")) {
-    if (res.body) {
-      try {
-        await res.body.cancel();
-      } catch (_) {}
-    }
-    return pageUrl;
-  }
-
-  let html = "";
-  try {
-    html = await res.text();
-  } catch (_) {
-    html = "";
-  }
-
-  const gf = extractGetFileLink(html, pageUrl);
-  if (gf) return gf;
-
-  let direct = extractDirectFromBody(html, pageUrl);
-  if (direct) return direct;
-
-  const candidates = extractCandidateUrls(html, pageUrl);
-
-  const directHit = candidates.find(isDirectLink);
-  if (directHit) return directHit;
-
-  for (let i = 0; i < candidates.length; i += CANDIDATE_BATCH) {
-    const batch = candidates.slice(i, i + CANDIDATE_BATCH);
-
-    const results = await Promise.all(
-      batch.map((c) => resolveCandidate(c, pageUrl, env).catch(() => null))
+// tktube / mmtube video page fetch
+async function resolveTktube(
+  pageUrl,
+  env
+) {
+  const pageHeaders =
+    buildPageHeaders(
+      pageUrl,
+      env
     );
 
-    const hit = results.find((r) => r);
-    if (hit) return hit;
-  }
-
-  return null;
-}
-
-// ★★★ fast-stream.jav.si/p/{hash-chain} link ကို HTML/JS ကနေ ဆွဲထုတ်
-function extractFastStreamLink(text, baseUrl) {
-  if (!text) return null;
-
-  let source = String(text)
-    .replace(/\\\//g, "/")
-    .replace(/\\u0026/g, "&")
-    .replace(/&amp;/g, "&")
-    .replace(/&#038;/g, "&");
-
-  const absRe =
-    /https?:\/\/[A-Za-z0-9.\-]*jav\.si\/p\/[0-9a-f]{4,}(?:-[0-9a-f]{2,})+[^\s"'\\<>()]*/gi;
-  const abs = source.match(absRe);
-  if (abs && abs.length) {
-    const best = abs.map(cleanUrl).sort((a, b) => b.length - a.length)[0];
-    if (best) return best;
-  }
-
-  return null;
-}
-
-// ★ tktube / mmtube ရဲ့ get_file video link ကို HTML/JS ကနေ ဆွဲထုတ်
-function extractGetFileLink(text, baseUrl) {
-  if (!text) return null;
-
-  let source = String(text)
-    .replace(/\\\//g, "/")
-    .replace(/\\u0026/g, "&")
-    .replace(/&amp;/g, "&")
-    .replace(/&#038;/g, "&");
-
-  let origin = "";
-  try {
-    origin = new URL(baseUrl).origin;
-  } catch (_) {}
-
-  const absRe =
-    /https?:\/\/[^\s"'\\<>()]+\/get_file\/[^\s"'\\<>()]+/gi;
-  const abs = source.match(absRe);
-  if (abs && abs.length) {
-    const best = abs.map(cleanUrl).sort((a, b) => b.length - a.length)[0];
-    if (best) return best;
-  }
-
-  if (origin) {
-    const relRe = /["'](\/get_file\/[^\s"'\\<>()]+)["']/gi;
-    let m;
-    let best = "";
-    while ((m = relRe.exec(source)) !== null) {
-      const cand = cleanUrl(m[1]);
-      if (cand.length > best.length) best = cand;
+  const response = await fetch(
+    pageUrl,
+    {
+      method: "GET",
+      headers: pageHeaders,
+      redirect: "follow",
     }
-    if (best) return origin + best;
-  }
+  );
 
-  return null;
-}
+  const contentType = (
+    response.headers.get(
+      "content-type"
+    ) || ""
+  ).toLowerCase();
 
-// ★★ javtiful gateway link (/media/video/{id}/{quality}) ကို HTML/JS ကနေ ဆွဲထုတ်
-function extractMediaGatewayLink(text, baseUrl) {
-  if (!text) return null;
-
-  let source = String(text)
-    .replace(/\\\//g, "/")
-    .replace(/\\u0026/g, "&")
-    .replace(/&amp;/g, "&")
-    .replace(/&#038;/g, "&");
-
-  let origin = "";
-  try {
-    origin = new URL(baseUrl).origin;
-  } catch (_) {}
-
-  const absRe =
-    /https?:\/\/[^\s"'\\<>()]+\/media\/video\/\d+\/[^\s"'\\<>()]+/gi;
-  const abs = source.match(absRe);
-  if (abs && abs.length) {
-    const best = abs.map(cleanUrl).sort((a, b) => b.length - a.length)[0];
-    if (best) return best;
-  }
-
-  if (origin) {
-    const relRe = /["'](\/media\/video\/\d+\/[^\s"'\\<>()]+)["']/gi;
-    let m;
-    let best = "";
-    while ((m = relRe.exec(source)) !== null) {
-      const cand = cleanUrl(m[1]);
-      if (cand.length > best.length) best = cand;
-    }
-    if (best) return origin + best;
-  }
-
-  return null;
-}
-
-// javtiful.com/video/... ကို fetch ပြီး video link extract
-// ★★★ (0) ဦးစားပေးဆုံး — fast-stream.jav.si/p/{hash} ရှာ (engine အသစ်)
-//    (A) မတွေ့ရင် — gateway link ရှာ → resolveMediaGateway
-//    (B) မတွေ့ရင် — R2 / storage link (engine အဟောင်း)
-async function resolveJavtiful(pageUrl, env) {
-  const pageHeaders = buildPageHeaders(pageUrl, env);
-
-  const res = await fetch(pageUrl, {
-    method: "GET",
-    headers: pageHeaders,
-    redirect: "follow",
-  });
-
-  const ct = (res.headers.get("content-type") || "").toLowerCase();
-
-  if (ct.startsWith("video/") || ct.startsWith("application/octet-stream")) {
-    if (res.body) {
+  if (
+    contentType.startsWith(
+      "video/"
+    ) ||
+    contentType.startsWith(
+      "application/octet-stream"
+    )
+  ) {
+    if (response.body) {
       try {
-        await res.body.cancel();
+        await response.body.cancel();
       } catch (_) {}
     }
+
     return pageUrl;
   }
 
   let html = "";
+
   try {
-    html = await res.text();
+    html = await response.text();
   } catch (_) {
     html = "";
   }
 
-  // ★★★ (0) ဦးစားပေးဆုံး — fast-stream.jav.si/p/{hash} direct link
-  const fast = extractFastStreamLink(html, pageUrl);
-  if (fast) return fast;
+  const getFile =
+    extractGetFileLink(
+      html,
+      pageUrl
+    );
 
-  // ★★ (A) gateway link ရှာ → ထပ် resolve
-  const gateway = extractMediaGatewayLink(html, pageUrl);
+  if (getFile) {
+    return getFile;
+  }
+
+  const direct =
+    extractDirectFromBody(
+      html,
+      pageUrl
+    );
+
+  if (direct) {
+    return direct;
+  }
+
+  const candidates =
+    extractCandidateUrls(
+      html,
+      pageUrl
+    );
+
+  const directHit =
+    candidates.find(
+      isDirectLink
+    );
+
+  if (directHit) {
+    return directHit;
+  }
+
+  for (
+    let index = 0;
+    index < candidates.length;
+    index += CANDIDATE_BATCH
+  ) {
+    const batch =
+      candidates.slice(
+        index,
+        index + CANDIDATE_BATCH
+      );
+
+    const results =
+      await Promise.all(
+        batch.map((candidate) =>
+          resolveCandidate(
+            candidate,
+            pageUrl,
+            env
+          ).catch(() => null)
+        )
+      );
+
+    const hit =
+      results.find(Boolean);
+
+    if (hit) {
+      return hit;
+    }
+  }
+
+  return null;
+}
+
+// ─────────────────────────────────────────────
+// Javtiful resolver
+// Main page → embed fallback → gateway/direct
+// ─────────────────────────────────────────────
+
+async function resolveJavtiful(
+  pageUrl,
+  env
+) {
+  const pageHeaders =
+    buildPageHeaders(
+      pageUrl,
+      env
+    );
+
+  let response;
+
+  try {
+    response = await fetch(
+      pageUrl,
+      {
+        method: "GET",
+        headers: pageHeaders,
+        redirect: "follow",
+      }
+    );
+  } catch (_) {
+    response = null;
+  }
+
+  let html = "";
+
+  if (response) {
+    const contentType = (
+      response.headers.get(
+        "content-type"
+      ) || ""
+    ).toLowerCase();
+
+    if (
+      contentType.startsWith(
+        "video/"
+      ) ||
+      contentType.startsWith(
+        "application/octet-stream"
+      )
+    ) {
+      if (response.body) {
+        try {
+          await response.body.cancel();
+        } catch (_) {}
+      }
+
+      return pageUrl;
+    }
+
+    try {
+      html =
+        await response.text();
+    } catch (_) {
+      html = "";
+    }
+  }
+
+  // 1. Main page ထဲမှာ fast-stream ရှာ
+  let fast =
+    extractFastStreamLink(
+      html,
+      pageUrl
+    );
+
+  if (fast) {
+    return fast;
+  }
+
+  // 2. Main page မှာမတွေ့ရင် /embed/{videoId}
+  const embedUrl =
+    getJavtifulEmbedUrl(
+      pageUrl
+    );
+
+  if (embedUrl) {
+    const embedHtml =
+      await fetchJavtifulEmbed(
+        embedUrl,
+        pageUrl,
+        env
+      );
+
+    // 2.1 Embed ထဲက fast-stream
+    fast =
+      extractFastStreamLink(
+        embedHtml,
+        embedUrl
+      );
+
+    if (fast) {
+      return fast;
+    }
+
+    // 2.2 Embed ထဲက gateway
+    const embedGateway =
+      extractMediaGatewayLink(
+        embedHtml,
+        embedUrl
+      );
+
+    if (embedGateway) {
+      const real =
+        await resolveMediaGateway(
+          embedGateway,
+          env
+        );
+
+      if (real) {
+        return real;
+      }
+
+      return embedGateway;
+    }
+
+    // 2.3 Embed ထဲက legacy/direct
+    const embedDirect =
+      extractDirectFromBody(
+        embedHtml,
+        embedUrl
+      );
+
+    if (embedDirect) {
+      return embedDirect;
+    }
+
+    // 2.4 Embed candidate links
+    const embedCandidates =
+      extractCandidateUrls(
+        embedHtml,
+        embedUrl
+      );
+
+    const embedFastHit =
+      embedCandidates.find(
+        isFastStreamUrl
+      );
+
+    if (embedFastHit) {
+      return embedFastHit;
+    }
+
+    const embedDirectHit =
+      embedCandidates.find(
+        isDirectLink
+      );
+
+    if (embedDirectHit) {
+      return embedDirectHit;
+    }
+
+    const embedGatewayHit =
+      embedCandidates.find(
+        isMediaGatewayUrl
+      );
+
+    if (embedGatewayHit) {
+      const real =
+        await resolveMediaGateway(
+          embedGatewayHit,
+          env
+        );
+
+      if (real) {
+        return real;
+      }
+
+      return embedGatewayHit;
+    }
+
+    for (
+      let index = 0;
+      index <
+      embedCandidates.length;
+      index += CANDIDATE_BATCH
+    ) {
+      const batch =
+        embedCandidates.slice(
+          index,
+          index +
+            CANDIDATE_BATCH
+        );
+
+      const results =
+        await Promise.all(
+          batch.map((candidate) =>
+            resolveCandidate(
+              candidate,
+              embedUrl,
+              env
+            ).catch(() => null)
+          )
+        );
+
+      const hit =
+        results.find(Boolean);
+
+      if (hit) {
+        return hit;
+      }
+    }
+  }
+
+  // 3. Main page gateway engine
+  const gateway =
+    extractMediaGatewayLink(
+      html,
+      pageUrl
+    );
+
   if (gateway) {
-    const real = await resolveMediaGateway(gateway, env);
-    if (real) return real;
+    const real =
+      await resolveMediaGateway(
+        gateway,
+        env
+      );
+
+    if (real) {
+      return real;
+    }
+
     return gateway;
   }
 
-  // ★★ (B) legacy — R2 / storage link embed
-  let direct = extractDirectFromBody(html, pageUrl);
-  if (direct) return direct;
-
-  const candidates = extractCandidateUrls(html, pageUrl);
-
-  const fastHit = candidates.find(isFastStreamUrl);
-  if (fastHit) return fastHit;
-
-  const directHit = candidates.find(isDirectLink);
-  if (directHit) return directHit;
-
-  for (let i = 0; i < candidates.length; i += CANDIDATE_BATCH) {
-    const batch = candidates.slice(i, i + CANDIDATE_BATCH);
-
-    const results = await Promise.all(
-      batch.map((c) => resolveCandidate(c, pageUrl, env).catch(() => null))
+  // 4. Main page legacy R2/direct
+  const direct =
+    extractDirectFromBody(
+      html,
+      pageUrl
     );
 
-    const hit = results.find((r) => r);
-    if (hit) return hit;
+  if (direct) {
+    return direct;
+  }
+
+  const candidates =
+    extractCandidateUrls(
+      html,
+      pageUrl
+    );
+
+  const fastHit =
+    candidates.find(
+      isFastStreamUrl
+    );
+
+  if (fastHit) {
+    return fastHit;
+  }
+
+  const directHit =
+    candidates.find(
+      isDirectLink
+    );
+
+  if (directHit) {
+    return directHit;
+  }
+
+  const gatewayHit =
+    candidates.find(
+      isMediaGatewayUrl
+    );
+
+  if (gatewayHit) {
+    const real =
+      await resolveMediaGateway(
+        gatewayHit,
+        env
+      );
+
+    if (real) {
+      return real;
+    }
+
+    return gatewayHit;
+  }
+
+  for (
+    let index = 0;
+    index < candidates.length;
+    index += CANDIDATE_BATCH
+  ) {
+    const batch =
+      candidates.slice(
+        index,
+        index + CANDIDATE_BATCH
+      );
+
+    const results =
+      await Promise.all(
+        batch.map((candidate) =>
+          resolveCandidate(
+            candidate,
+            pageUrl,
+            env
+          ).catch(() => null)
+        )
+      );
+
+    const hit =
+      results.find(Boolean);
+
+    if (hit) {
+      return hit;
+    }
   }
 
   return null;
 }
 
-async function resolveCandidate(candidateUrl, refererUrl, env) {
-  const headers = buildPageHeaders(refererUrl, env);
+// fast-stream link ကို HTML/JS ကနေ ဆွဲထုတ်
+function extractFastStreamLink(
+  text,
+  baseUrl
+) {
+  if (!text) {
+    return null;
+  }
 
-  headers.set("X-Requested-With", "XMLHttpRequest");
-  headers.set("Accept", "application/json,text/plain,text/html,*/*");
+  const source =
+    normalizeSource(text);
 
-  let currentUrl = candidateUrl;
+  // Absolute fast-stream URL
+  const absoluteRegex =
+    /https?:\/\/fast-stream\.jav\.si\/p\/[0-9a-f]{4,}(?:-[0-9a-f]{2,})+\/?(?:\?[^\s"'\\<>()]*)?/gi;
 
-  for (let i = 0; i < RESOLVE_LIMIT; i++) {
-    let res;
+  const absoluteMatches =
+    source.match(
+      absoluteRegex
+    );
+
+  if (
+    absoluteMatches &&
+    absoluteMatches.length
+  ) {
+    const links =
+      absoluteMatches
+        .map(cleanUrl)
+        .filter(isFastStreamUrl)
+        .sort(
+          (first, second) =>
+            second.length -
+            first.length
+        );
+
+    if (links.length) {
+      return links[0];
+    }
+  }
+
+  // JSON / quoted string fallback
+  const quotedRegex =
+    /["']([^"']*fast-stream\.jav\.si\/p\/[^"']+)["']/gi;
+
+  let match;
+
+  while (
+    (match =
+      quotedRegex.exec(source)) !==
+    null
+  ) {
+    let candidate =
+      cleanUrl(match[1]);
+
+    if (
+      !/^https?:\/\//i.test(
+        candidate
+      )
+    ) {
+      candidate =
+        "https://" + candidate;
+    }
+
+    if (
+      isFastStreamUrl(candidate)
+    ) {
+      return candidate;
+    }
+  }
+
+  // Relative /p/{hash-chain}
+  const relativeRegex =
+    /["'](\/p\/[0-9a-f]{4,}(?:-[0-9a-f]{2,})+\/?(?:\?[^"']*)?)["']/gi;
+
+  while (
+    (match =
+      relativeRegex.exec(source)) !==
+    null
+  ) {
+    try {
+      let origin =
+        "https://fast-stream.jav.si";
+
+      if (baseUrl) {
+        const base =
+          new URL(baseUrl);
+
+        if (
+          base.hostname.toLowerCase() ===
+          "fast-stream.jav.si"
+        ) {
+          origin = base.origin;
+        }
+      }
+
+      const candidate =
+        new URL(
+          match[1],
+          origin
+        ).toString();
+
+      if (
+        isFastStreamUrl(candidate)
+      ) {
+        return candidate;
+      }
+    } catch (_) {}
+  }
+
+  return null;
+}
+
+// tktube / mmtube get_file link
+function extractGetFileLink(
+  text,
+  baseUrl
+) {
+  if (!text) {
+    return null;
+  }
+
+  const source =
+    normalizeSource(text);
+
+  let origin = "";
+
+  try {
+    origin =
+      new URL(baseUrl).origin;
+  } catch (_) {}
+
+  const absoluteRegex =
+    /https?:\/\/[^\s"'\\<>()]+\/get_file\/[^\s"'\\<>()]+/gi;
+
+  const absoluteMatches =
+    source.match(
+      absoluteRegex
+    );
+
+  if (
+    absoluteMatches &&
+    absoluteMatches.length
+  ) {
+    const best =
+      absoluteMatches
+        .map(cleanUrl)
+        .sort(
+          (first, second) =>
+            second.length -
+            first.length
+        )[0];
+
+    if (best) {
+      return best;
+    }
+  }
+
+  if (origin) {
+    const relativeRegex =
+      /["'](\/get_file\/[^\s"'\\<>()]+)["']/gi;
+
+    let match;
+    let best = "";
+
+    while (
+      (match =
+        relativeRegex.exec(
+          source
+        )) !== null
+    ) {
+      const candidate =
+        cleanUrl(match[1]);
+
+      if (
+        candidate.length >
+        best.length
+      ) {
+        best = candidate;
+      }
+    }
+
+    if (best) {
+      return origin + best;
+    }
+  }
+
+  return null;
+}
+
+// Javtiful gateway link extract
+function extractMediaGatewayLink(
+  text,
+  baseUrl
+) {
+  if (!text) {
+    return null;
+  }
+
+  const source =
+    normalizeSource(text);
+
+  let origin = "";
+
+  try {
+    origin =
+      new URL(baseUrl).origin;
+  } catch (_) {}
+
+  const absoluteRegex =
+    /https?:\/\/[^\s"'\\<>()]+\/media\/video\/\d+\/[^\s"'\\<>()]+/gi;
+
+  const absoluteMatches =
+    source.match(
+      absoluteRegex
+    );
+
+  if (
+    absoluteMatches &&
+    absoluteMatches.length
+  ) {
+    const links =
+      absoluteMatches
+        .map(cleanUrl)
+        .filter(
+          isMediaGatewayUrl
+        )
+        .sort(
+          (first, second) =>
+            second.length -
+            first.length
+        );
+
+    if (links.length) {
+      return links[0];
+    }
+  }
+
+  if (origin) {
+    const relativeRegex =
+      /["'](\/media\/video\/\d+\/[^\s"'\\<>()]+)["']/gi;
+
+    let match;
+    let best = "";
+
+    while (
+      (match =
+        relativeRegex.exec(
+          source
+        )) !== null
+    ) {
+      const candidate =
+        cleanUrl(match[1]);
+
+      if (
+        candidate.length >
+        best.length
+      ) {
+        best = candidate;
+      }
+    }
+
+    if (best) {
+      const absolute =
+        origin + best;
+
+      if (
+        isMediaGatewayUrl(
+          absolute
+        )
+      ) {
+        return absolute;
+      }
+    }
+  }
+
+  return null;
+}
+
+async function resolveCandidate(
+  candidateUrl,
+  refererUrl,
+  env
+) {
+  if (
+    isFastStreamUrl(
+      candidateUrl
+    )
+  ) {
+    return candidateUrl;
+  }
+
+  if (
+    isDirectLink(candidateUrl)
+  ) {
+    return candidateUrl;
+  }
+
+  const headers =
+    buildPageHeaders(
+      refererUrl,
+      env
+    );
+
+  headers.set(
+    "X-Requested-With",
+    "XMLHttpRequest"
+  );
+
+  headers.set(
+    "Accept",
+    "application/json,text/plain,text/html,*/*"
+  );
+
+  let currentUrl =
+    candidateUrl;
+
+  for (
+    let index = 0;
+    index < RESOLVE_LIMIT;
+    index++
+  ) {
+    let response;
 
     try {
-      res = await fetch(currentUrl, {
-        method: "GET",
-        headers,
-        redirect: "manual",
-      });
+      response = await fetch(
+        currentUrl,
+        {
+          method: "GET",
+          headers,
+          redirect: "manual",
+        }
+      );
     } catch (_) {
       return null;
     }
 
-    if (res.status >= 300 && res.status < 400) {
-      if (res.body) {
+    if (
+      response.status >= 300 &&
+      response.status < 400
+    ) {
+      if (response.body) {
         try {
-          await res.body.cancel();
+          await response.body.cancel();
         } catch (_) {}
       }
 
-      const loc = res.headers.get("Location");
-      if (!loc) return null;
+      const location =
+        response.headers.get(
+          "Location"
+        );
 
-      const absLoc = new URL(loc, currentUrl).toString();
-      if (isFastStreamUrl(absLoc)) return absLoc;
-      if (isDirectLink(absLoc)) return absLoc;
+      if (!location) {
+        return null;
+      }
 
-      currentUrl = absLoc;
+      const absoluteLocation =
+        new URL(
+          location,
+          currentUrl
+        ).toString();
+
+      if (
+        isFastStreamUrl(
+          absoluteLocation
+        )
+      ) {
+        return absoluteLocation;
+      }
+
+      if (
+        isDirectLink(
+          absoluteLocation
+        )
+      ) {
+        return absoluteLocation;
+      }
+
+      currentUrl =
+        absoluteLocation;
+
       continue;
     }
 
-    const ct = (res.headers.get("content-type") || "").toLowerCase();
+    const contentType = (
+      response.headers.get(
+        "content-type"
+      ) || ""
+    ).toLowerCase();
 
     if (
-      ct.startsWith("video/") ||
-      ct.includes("mpegurl") ||
-      ct.startsWith("application/octet-stream")
+      contentType.startsWith(
+        "video/"
+      ) ||
+      contentType.includes(
+        "mpegurl"
+      ) ||
+      contentType.startsWith(
+        "application/octet-stream"
+      )
     ) {
-      if (res.body) {
+      if (response.body) {
         try {
-          await res.body.cancel();
+          await response.body.cancel();
         } catch (_) {}
       }
+
       return currentUrl;
     }
 
-    if (isDirectLink(currentUrl)) {
-      if (res.body) {
+    if (
+      isDirectLink(currentUrl)
+    ) {
+      if (response.body) {
         try {
-          await res.body.cancel();
+          await response.body.cancel();
         } catch (_) {}
       }
+
       return currentUrl;
     }
 
     let text = "";
+
     try {
-      text = await res.text();
+      text =
+        await response.text();
     } catch (_) {
       text = "";
     }
 
-    // ★★★ fast-stream link ကို candidate response ကနေလည်း ရှာ
-    const fast = extractFastStreamLink(text, currentUrl);
-    if (fast) return fast;
+    const fast =
+      extractFastStreamLink(
+        text,
+        currentUrl
+      );
 
-    // ★★ gateway link ကို candidate response ကနေလည်း ရှာ
-    const gw = extractMediaGatewayLink(text, currentUrl);
-    if (gw) {
-      const real = await resolveMediaGateway(gw, env);
-      if (real) return real;
-      return gw;
+    if (fast) {
+      return fast;
     }
 
-    const gf = extractGetFileLink(text, currentUrl);
-    if (gf) return gf;
+    const gateway =
+      extractMediaGatewayLink(
+        text,
+        currentUrl
+      );
 
-    const found = extractDirectFromBody(text, currentUrl);
-    if (found) return found;
+    if (gateway) {
+      const real =
+        await resolveMediaGateway(
+          gateway,
+          env
+        );
 
-    const more = extractCandidateUrls(text, currentUrl);
-    for (const m of more.slice(0, 5)) {
-      if (isDirectLink(m)) return m;
+      if (real) {
+        return real;
+      }
+
+      return gateway;
+    }
+
+    const getFile =
+      extractGetFileLink(
+        text,
+        currentUrl
+      );
+
+    if (getFile) {
+      return getFile;
+    }
+
+    const direct =
+      extractDirectFromBody(
+        text,
+        currentUrl
+      );
+
+    if (direct) {
+      return direct;
+    }
+
+    const more =
+      extractCandidateUrls(
+        text,
+        currentUrl
+      );
+
+    for (
+      const candidate of
+      more.slice(0, 5)
+    ) {
+      if (
+        isFastStreamUrl(
+          candidate
+        )
+      ) {
+        return candidate;
+      }
+
+      if (
+        isDirectLink(candidate)
+      ) {
+        return candidate;
+      }
+
+      if (
+        isMediaGatewayUrl(
+          candidate
+        )
+      ) {
+        const real =
+          await resolveMediaGateway(
+            candidate,
+            env
+          );
+
+        if (real) {
+          return real;
+        }
+
+        return candidate;
+      }
     }
 
     break;
@@ -972,145 +2409,356 @@ async function resolveCandidate(candidateUrl, refererUrl, env) {
 }
 
 // Generic resolver
-async function resolveGeneric(srcUrl, env) {
-  const headers = buildPageHeaders(srcUrl, env);
+async function resolveGeneric(
+  srcUrl,
+  env
+) {
+  const headers =
+    buildPageHeaders(
+      srcUrl,
+      env
+    );
 
   let currentUrl = srcUrl;
 
-  for (let i = 0; i < RESOLVE_LIMIT; i++) {
-    let res;
+  for (
+    let index = 0;
+    index < RESOLVE_LIMIT;
+    index++
+  ) {
+    if (
+      isFastStreamUrl(
+        currentUrl
+      )
+    ) {
+      return currentUrl;
+    }
+
+    let headResponse;
+
     try {
-      res = await fetch(currentUrl, {
-        method: "HEAD",
-        headers,
-        redirect: "manual",
-      });
+      headResponse = await fetch(
+        currentUrl,
+        {
+          method: "HEAD",
+          headers,
+          redirect: "manual",
+        }
+      );
     } catch (_) {
-      res = null;
+      headResponse = null;
     }
 
     const headUnsupported =
-      !res || res.status === 405 || res.status === 501 || res.status === 400;
+      !headResponse ||
+      headResponse.status === 405 ||
+      headResponse.status === 501 ||
+      headResponse.status === 400;
 
-    if (!headUnsupported && res.status >= 300 && res.status < 400) {
-      const loc = res.headers.get("Location");
-      if (loc) {
-        const absLoc = new URL(loc, currentUrl).toString();
-        if (isDirectLink(absLoc)) return absLoc;
-        currentUrl = absLoc;
+    if (
+      !headUnsupported &&
+      headResponse.status >= 300 &&
+      headResponse.status < 400
+    ) {
+      const location =
+        headResponse.headers.get(
+          "Location"
+        );
+
+      if (location) {
+        const absoluteLocation =
+          new URL(
+            location,
+            currentUrl
+          ).toString();
+
+        if (
+          isFastStreamUrl(
+            absoluteLocation
+          ) ||
+          isDirectLink(
+            absoluteLocation
+          )
+        ) {
+          return absoluteLocation;
+        }
+
+        currentUrl =
+          absoluteLocation;
+
         continue;
       }
     }
 
     if (!headUnsupported) {
-      if (res.status >= 200 && res.status < 300 && isDirectLink(currentUrl)) {
+      if (
+        headResponse.status >= 200 &&
+        headResponse.status < 300 &&
+        isDirectLink(currentUrl)
+      ) {
         return currentUrl;
       }
 
-      const hct = (res.headers.get("content-type") || "").toLowerCase();
+      const contentType = (
+        headResponse.headers.get(
+          "content-type"
+        ) || ""
+      ).toLowerCase();
+
       if (
-        res.status >= 200 &&
-        res.status < 300 &&
-        (hct.startsWith("video/") ||
-          hct.includes("mpegurl") ||
-          hct.startsWith("application/octet-stream"))
+        headResponse.status >= 200 &&
+        headResponse.status < 300 &&
+        (
+          contentType.startsWith(
+            "video/"
+          ) ||
+          contentType.includes(
+            "mpegurl"
+          ) ||
+          contentType.startsWith(
+            "application/octet-stream"
+          )
+        )
       ) {
         return currentUrl;
       }
     }
 
-    const getRes = await fetch(currentUrl, {
-      method: "GET",
-      headers,
-      redirect: "manual",
-    });
+    let getResponse;
 
-    if (getRes.status >= 300 && getRes.status < 400) {
-      if (getRes.body) {
+    try {
+      getResponse = await fetch(
+        currentUrl,
+        {
+          method: "GET",
+          headers,
+          redirect: "manual",
+        }
+      );
+    } catch (_) {
+      break;
+    }
+
+    if (
+      getResponse.status >= 300 &&
+      getResponse.status < 400
+    ) {
+      if (getResponse.body) {
         try {
-          await getRes.body.cancel();
+          await getResponse.body.cancel();
         } catch (_) {}
       }
 
-      const loc = getRes.headers.get("Location");
-      if (!loc) break;
+      const location =
+        getResponse.headers.get(
+          "Location"
+        );
 
-      const absLoc = new URL(loc, currentUrl).toString();
-      if (isDirectLink(absLoc)) return absLoc;
+      if (!location) {
+        break;
+      }
 
-      currentUrl = absLoc;
+      const absoluteLocation =
+        new URL(
+          location,
+          currentUrl
+        ).toString();
+
+      if (
+        isFastStreamUrl(
+          absoluteLocation
+        ) ||
+        isDirectLink(
+          absoluteLocation
+        )
+      ) {
+        return absoluteLocation;
+      }
+
+      currentUrl =
+        absoluteLocation;
+
       continue;
     }
 
-    if (isDirectLink(currentUrl)) {
-      if (getRes.body) {
-        try {
-          await getRes.body.cancel();
-        } catch (_) {}
-      }
-      return currentUrl;
-    }
-
-    const ct = (getRes.headers.get("content-type") || "").toLowerCase();
-
     if (
-      ct.startsWith("video/") ||
-      ct.includes("mpegurl") ||
-      ct.startsWith("application/octet-stream")
+      isDirectLink(currentUrl)
     ) {
-      if (getRes.body) {
+      if (getResponse.body) {
         try {
-          await getRes.body.cancel();
+          await getResponse.body.cancel();
         } catch (_) {}
       }
+
+      return currentUrl;
+    }
+
+    const contentType = (
+      getResponse.headers.get(
+        "content-type"
+      ) || ""
+    ).toLowerCase();
+
+    if (
+      contentType.startsWith(
+        "video/"
+      ) ||
+      contentType.includes(
+        "mpegurl"
+      ) ||
+      contentType.startsWith(
+        "application/octet-stream"
+      )
+    ) {
+      if (getResponse.body) {
+        try {
+          await getResponse.body.cancel();
+        } catch (_) {}
+      }
+
       return currentUrl;
     }
 
     if (
-      ct.includes("text/html") ||
-      ct.includes("javascript") ||
-      ct.includes("json") ||
-      ct.includes("text/plain")
+      contentType.includes(
+        "text/html"
+      ) ||
+      contentType.includes(
+        "javascript"
+      ) ||
+      contentType.includes(
+        "json"
+      ) ||
+      contentType.includes(
+        "text/plain"
+      )
     ) {
       let bodyText = "";
+
       try {
-        bodyText = await getRes.text();
-      } catch (_) {}
-
-      // ★★★ fast-stream link ကို generic body ကနေလည်း ရှာ
-      const fast = extractFastStreamLink(bodyText, currentUrl);
-      if (fast) return fast;
-
-      const gw = extractMediaGatewayLink(bodyText, currentUrl);
-      if (gw) {
-        const real = await resolveMediaGateway(gw, env);
-        if (real) return real;
-        return gw;
+        bodyText =
+          await getResponse.text();
+      } catch (_) {
+        bodyText = "";
       }
 
-      const gf = extractGetFileLink(bodyText, currentUrl);
-      if (gf) return gf;
-
-      const found = extractDirectFromBody(bodyText, currentUrl);
-      if (found) return found;
-
-      const cands = extractCandidateUrls(bodyText, currentUrl);
-
-      const fastHit = cands.find(isFastStreamUrl);
-      if (fastHit) return fastHit;
-
-      const dHit = cands.find(isDirectLink);
-      if (dHit) return dHit;
-
-      for (let j = 0; j < cands.length && j < CANDIDATE_BATCH; j++) {
-        const r = await resolveCandidate(cands[j], currentUrl, env).catch(
-          () => null
+      const fast =
+        extractFastStreamLink(
+          bodyText,
+          currentUrl
         );
-        if (r) return r;
+
+      if (fast) {
+        return fast;
       }
-    } else if (getRes.body) {
+
+      const gateway =
+        extractMediaGatewayLink(
+          bodyText,
+          currentUrl
+        );
+
+      if (gateway) {
+        const real =
+          await resolveMediaGateway(
+            gateway,
+            env
+          );
+
+        if (real) {
+          return real;
+        }
+
+        return gateway;
+      }
+
+      const getFile =
+        extractGetFileLink(
+          bodyText,
+          currentUrl
+        );
+
+      if (getFile) {
+        return getFile;
+      }
+
+      const direct =
+        extractDirectFromBody(
+          bodyText,
+          currentUrl
+        );
+
+      if (direct) {
+        return direct;
+      }
+
+      const candidates =
+        extractCandidateUrls(
+          bodyText,
+          currentUrl
+        );
+
+      const fastHit =
+        candidates.find(
+          isFastStreamUrl
+        );
+
+      if (fastHit) {
+        return fastHit;
+      }
+
+      const directHit =
+        candidates.find(
+          isDirectLink
+        );
+
+      if (directHit) {
+        return directHit;
+      }
+
+      const gatewayHit =
+        candidates.find(
+          isMediaGatewayUrl
+        );
+
+      if (gatewayHit) {
+        const real =
+          await resolveMediaGateway(
+            gatewayHit,
+            env
+          );
+
+        if (real) {
+          return real;
+        }
+
+        return gatewayHit;
+      }
+
+      for (
+        let candidateIndex = 0;
+        candidateIndex <
+          candidates.length &&
+        candidateIndex <
+          CANDIDATE_BATCH;
+        candidateIndex++
+      ) {
+        const found =
+          await resolveCandidate(
+            candidates[
+              candidateIndex
+            ],
+            currentUrl,
+            env
+          ).catch(() => null);
+
+        if (found) {
+          return found;
+        }
+      }
+    } else if (getResponse.body) {
       try {
-        await getRes.body.cancel();
+        await getResponse.body.cancel();
       } catch (_) {}
     }
 
@@ -1120,95 +2768,145 @@ async function resolveGeneric(srcUrl, env) {
   return null;
 }
 
-function buildPageHeaders(url, env) {
+function buildPageHeaders(
+  url,
+  env
+) {
   const headers = new Headers();
 
-  headers.set("User-Agent", UA);
+  headers.set(
+    "User-Agent",
+    UA
+  );
+
   headers.set(
     "Accept",
     "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,text/plain,*/*;q=0.8"
   );
-  headers.set("Accept-Language", "en-US,en;q=0.9");
-  headers.set("Cache-Control", "no-cache");
-  headers.set("Pragma", "no-cache");
 
-  const referer = getRefererForSource(url);
-  if (referer) headers.set("Referer", referer);
+  headers.set(
+    "Accept-Language",
+    "en-US,en;q=0.9"
+  );
+
+  headers.set(
+    "Cache-Control",
+    "no-cache"
+  );
+
+  headers.set(
+    "Pragma",
+    "no-cache"
+  );
+
+  const referer =
+    getRefererForSource(url);
+
+  if (referer) {
+    headers.set(
+      "Referer",
+      referer
+    );
+  }
 
   if (
     env &&
     env.JAVTIFUL_COOKIE &&
-    (isJavtifulPageUrl(url) || isMediaGatewayUrl(url) || isFastStreamUrl(url))
+    (
+      isJavtifulPageUrl(url) ||
+      isJavtifulEmbedUrl(url) ||
+      isMediaGatewayUrl(url) ||
+      isFastStreamUrl(url)
+    )
   ) {
-    headers.set("Cookie", env.JAVTIFUL_COOKIE);
+    headers.set(
+      "Cookie",
+      env.JAVTIFUL_COOKIE
+    );
   }
 
   if (
     env &&
     env.SITE_COOKIE &&
     !isJavtifulPageUrl(url) &&
+    !isJavtifulEmbedUrl(url) &&
     !isMediaGatewayUrl(url) &&
     !isFastStreamUrl(url)
   ) {
-    headers.set("Cookie", env.SITE_COOKIE);
+    headers.set(
+      "Cookie",
+      env.SITE_COOKIE
+    );
   }
 
   return headers;
 }
 
-function getRefererForSource(srcUrl, directUrl = "") {
-  // ★★★ fast-stream / jav.si direct link ဆို Referer ကို javtiful.com ထားပေး
+function getRefererForSource(
+  srcUrl,
+  directUrl = ""
+) {
+  if (
+    isFastStreamUrl(srcUrl) ||
+    isFastStreamUrl(directUrl)
+  ) {
+    return "https://javtiful.com/";
+  }
+
   try {
-    if (isFastStreamUrl(srcUrl) || isFastStreamUrl(directUrl)) {
-      return "https://javtiful.com/";
-    }
+    const url = new URL(
+      srcUrl || directUrl
+    );
+
+    return url.origin + "/";
   } catch (_) {}
 
   try {
-    const u = new URL(srcUrl || directUrl);
-    return u.origin + "/";
-  } catch (_) {}
+    const direct =
+      new URL(directUrl);
 
-  try {
-    const d = new URL(directUrl);
-    return d.origin + "/";
+    return direct.origin + "/";
   } catch (_) {}
 
   return "https://google.com/";
 }
 
-function isJavtifulPageUrl(u) {
-  try {
-    const url = new URL(u);
-    const host = url.hostname.toLowerCase();
-
-    return (
-      (host === "javtiful.com" || host.endsWith(".javtiful.com")) &&
-      /^\/(?:[a-z]{2}\/)?video\/\d+\//i.test(url.pathname)
-    );
-  } catch (_) {
+function isDirectLink(value) {
+  if (!value) {
     return false;
   }
-}
 
-function isDirectLink(u) {
-  if (!u) return false;
+  if (isFastStreamUrl(value)) {
+    return true;
+  }
 
-  // ★★★ fast-stream.jav.si/p/{hash} ဆို direct
-  if (isFastStreamUrl(u)) return true;
+  if (
+    isMediaGatewayUrl(value)
+  ) {
+    return false;
+  }
 
-  // ★★ gateway link ဆို direct မဟုတ် — ထပ် resolve
-  if (isMediaGatewayUrl(u)) return false;
-
-  if (DIRECT_HOST_RE.test(u)) return true;
+  if (
+    DIRECT_HOST_RE.test(value)
+  ) {
+    return true;
+  }
 
   try {
-    const url = new URL(u);
-
-    if (/\/get_file\//i.test(url.pathname)) return true;
+    const url = new URL(value);
 
     if (
-      DIRECT_PATH_RE.test(url.pathname) &&
+      /\/get_file\//i.test(
+        url.pathname
+      )
+    ) {
+      return true;
+    }
+
+    if (
+      DIRECT_PATH_RE.test(
+        url.pathname
+      ) &&
       /[?&](?:token|fileid|file_id|fid|key|id|acctoken|v-acctoken)=/i.test(
         url.search
       )
@@ -1216,87 +2914,207 @@ function isDirectLink(u) {
       return true;
     }
 
-    if (/\.(?:mp4|m3u8|ts)\//i.test(url.pathname)) return true;
+    if (
+      /\.(?:mp4|m3u8|ts)\//i.test(
+        url.pathname
+      )
+    ) {
+      return true;
+    }
   } catch (_) {}
 
   return (
-    /X-Amz-Signature=/i.test(u) ||
-    /X-Amz-Credential=/i.test(u) ||
-    /r2\.cloudflarestorage\.com/i.test(u) ||
-    /(?:^|\.)r2\.dev\//i.test(u) ||
-    /cloudflarestream\.com/i.test(u) ||
-    /[?&](?:expires|e|exp|signature|sign|token|hash|md5|acctoken|v-acctoken)=/i.test(
-      u
+    /X-Amz-Signature=/i.test(
+      value
     ) ||
-    /\.(?:mp4|m3u8|ts)(?:[?#/]|$)/i.test(u)
+    /X-Amz-Credential=/i.test(
+      value
+    ) ||
+    /r2\.cloudflarestorage\.com/i.test(
+      value
+    ) ||
+    /(?:^|\.)r2\.dev\//i.test(
+      value
+    ) ||
+    /cloudflarestream\.com/i.test(
+      value
+    ) ||
+    /[?&](?:expires|e|exp|signature|sign|token|hash|md5|acctoken|v-acctoken)=/i.test(
+      value
+    ) ||
+    /\.(?:mp4|m3u8|ts)(?:[?#/]|$)/i.test(
+      value
+    )
   );
 }
 
-function extractDirectFromBody(text, baseUrl, depth = 0) {
-  if (!text) return null;
+function extractDirectFromBody(
+  text,
+  baseUrl,
+  depth = 0
+) {
+  if (!text) {
+    return null;
+  }
 
-  let source = String(text);
+  const source =
+    normalizeSource(text);
 
-  source = source
-    .replace(/\\\//g, "/")
-    .replace(/\\u0026/g, "&")
-    .replace(/&amp;/g, "&")
-    .replace(/&#038;/g, "&");
+  // fast-stream ကို direct extractor ကနေလည်း စစ်
+  const fast =
+    extractFastStreamLink(
+      source,
+      baseUrl
+    );
 
-  const storageRe =
+  if (fast) {
+    return fast;
+  }
+
+  const storageRegex =
     /https?:\/\/[^\s"'\\<>()]+(?:(?:r2\.cloudflarestorage\.com)|(?:\.r2\.dev)|(?:cloudflarestream\.com)|(?:qyshare\.com)|(?:\/get_file\/)|(?:\.mp4)|(?:\.m3u8))[^\s"'\\<>()]*/gi;
 
-  const storage = source.match(storageRe);
-  if (storage && storage.length) {
-    const sorted = storage
-      .map(cleanUrl)
-      .filter(Boolean)
-      .sort((a, b) => b.length - a.length);
-    const good = sorted.find(isDirectLink);
-    if (good) return good;
+  const storageMatches =
+    source.match(storageRegex);
+
+  if (
+    storageMatches &&
+    storageMatches.length
+  ) {
+    const links =
+      storageMatches
+        .map(cleanUrl)
+        .filter(Boolean)
+        .sort(
+          (first, second) =>
+            second.length -
+            first.length
+        );
+
+    const direct =
+      links.find(
+        isDirectLink
+      );
+
+    if (direct) {
+      return direct;
+    }
   }
 
-  const signedRe =
+  const signedRegex =
     /https?:\/\/[^\s"'\\<>()]+(?:X-Amz-Signature=|X-Amz-Credential=|[?&](?:expires|signature|sign|token|hash|md5|acctoken|v-acctoken)=)[^\s"'\\<>()]*/gi;
 
-  const signed = source.match(signedRe);
-  if (signed && signed.length) {
-    const cleaned = signed
-      .map(cleanUrl)
-      .filter((x) => x && !isMediaGatewayUrl(x))
-      .sort((a, b) => b.length - a.length);
-    if (cleaned.length) return cleaned[0];
+  const signedMatches =
+    source.match(signedRegex);
+
+  if (
+    signedMatches &&
+    signedMatches.length
+  ) {
+    const links =
+      signedMatches
+        .map(cleanUrl)
+        .filter(
+          (link) =>
+            link &&
+            !isMediaGatewayUrl(
+              link
+            )
+        )
+        .sort(
+          (first, second) =>
+            second.length -
+            first.length
+        );
+
+    const direct =
+      links.find(
+        isDirectLink
+      );
+
+    if (direct) {
+      return direct;
+    }
   }
 
-  const fileRe =
+  const fileRegex =
     /(?:file|src|url|source|videoUrl|video_url|stream|stream_url|hls|hlsUrl|playlist)\s*[:=]\s*["']([^"']+(?:\.(?:mp4|m3u8)|\/get_file\/)[^"']*)["']/gi;
 
-  let m;
-  while ((m = fileRe.exec(source)) !== null) {
+  let match;
+
+  while (
+    (match =
+      fileRegex.exec(source)) !==
+    null
+  ) {
     try {
-      const abs = new URL(m[1], baseUrl).toString();
-      if (isDirectLink(abs)) return cleanUrl(abs);
+      const absolute =
+        new URL(
+          match[1],
+          baseUrl
+        ).toString();
+
+      if (
+        isDirectLink(absolute)
+      ) {
+        return cleanUrl(
+          absolute
+        );
+      }
     } catch (_) {}
   }
 
-  const quotedUrlRe =
+  const quotedUrlRegex =
     /["'](https?:\/\/[^"']+(?:\.(?:mp4|m3u8)(?:\?[^"']*)?|\/get_file\/[^"']*))["']/gi;
 
-  while ((m = quotedUrlRe.exec(source)) !== null) {
-    const u = cleanUrl(m[1]);
-    if (isDirectLink(u)) return u;
+  while (
+    (match =
+      quotedUrlRegex.exec(
+        source
+      )) !== null
+  ) {
+    const direct =
+      cleanUrl(match[1]);
+
+    if (
+      isDirectLink(direct)
+    ) {
+      return direct;
+    }
   }
 
   if (depth < 1) {
-    const b64Re = /["']([A-Za-z0-9+/=]{80,})["']/g;
-    let b;
+    const base64Regex =
+      /["']([A-Za-z0-9+/=]{80,})["']/g;
 
-    while ((b = b64Re.exec(source)) !== null) {
+    let encodedMatch;
+
+    while (
+      (encodedMatch =
+        base64Regex.exec(
+          source
+        )) !== null
+    ) {
       try {
-        const decoded = atob(b[1]);
-        if (/https?:\/\//i.test(decoded)) {
-          const found = extractDirectFromBody(decoded, baseUrl, depth + 1);
-          if (found) return found;
+        const decoded = atob(
+          encodedMatch[1]
+        );
+
+        if (
+          /https?:\/\//i.test(
+            decoded
+          )
+        ) {
+          const direct =
+            extractDirectFromBody(
+              decoded,
+              baseUrl,
+              depth + 1
+            );
+
+          if (direct) {
+            return direct;
+          }
         }
       } catch (_) {}
     }
@@ -1305,93 +3123,220 @@ function extractDirectFromBody(text, baseUrl, depth = 0) {
   return null;
 }
 
-function extractCandidateUrls(text, baseUrl) {
-  const out = [];
+function extractCandidateUrls(
+  text,
+  baseUrl
+) {
+  const output = [];
   const seen = new Set();
 
-  if (!text) return out;
+  if (!text) {
+    return output;
+  }
 
-  let source = String(text);
+  const source =
+    normalizeSource(text);
 
-  source = source
-    .replace(/\\\//g, "/")
-    .replace(/\\u0026/g, "&")
-    .replace(/&amp;/g, "&")
-    .replace(/&#038;/g, "&");
-
-  function add(u) {
+  function add(value) {
     try {
-      if (!u) return;
-
-      if (/^(javascript:|data:|mailto:|tel:)/i.test(u)) return;
-
-      const abs = new URL(u, baseUrl).toString();
-
-      if (seen.has(abs)) return;
-      seen.add(abs);
-
-      // ★★★ fast-stream link ဆို ဦးစားပေး ထည့်
-      if (isFastStreamUrl(abs)) {
-        out.push(abs);
-        return;
-      }
-
-      if (isDirectLink(abs)) {
-        out.push(abs);
-        return;
-      }
-
-      const parsed = new URL(abs);
-      const p = parsed.pathname.toLowerCase();
-      const q = parsed.search.toLowerCase();
-
-      if (isMediaGatewayUrl(abs)) {
-        out.push(abs);
+      if (!value) {
         return;
       }
 
       if (
-        /\/(?:api|ajax|source|sources|stream|streams|player|playlist|download|embed|hls|m3u8|get_file|media)\b/i.test(
-          p
-        ) ||
-        /(?:source|stream|video|file|token|download|hls)/i.test(q)
+        /^(javascript:|data:|mailto:|tel:)/i.test(
+          value
+        )
       ) {
-        out.push(abs);
+        return;
+      }
+
+      const absolute =
+        new URL(
+          value,
+          baseUrl
+        ).toString();
+
+      if (seen.has(absolute)) {
+        return;
+      }
+
+      seen.add(absolute);
+
+      if (
+        isFastStreamUrl(
+          absolute
+        )
+      ) {
+        output.push(absolute);
+        return;
+      }
+
+      if (
+        isDirectLink(absolute)
+      ) {
+        output.push(absolute);
+        return;
+      }
+
+      if (
+        isMediaGatewayUrl(
+          absolute
+        )
+      ) {
+        output.push(absolute);
+        return;
+      }
+
+      const parsed =
+        new URL(absolute);
+
+      const path =
+        parsed.pathname.toLowerCase();
+
+      const query =
+        parsed.search.toLowerCase();
+
+      if (
+        /\/(?:api|ajax|source|sources|stream|streams|player|playlist|download|embed|hls|m3u8|get_file|media)\b/i.test(
+          path
+        ) ||
+        /(?:source|stream|video|file|token|download|hls)/i.test(
+          query
+        )
+      ) {
+        output.push(absolute);
       }
     } catch (_) {}
   }
 
-  const quotedRe = /["']([^"']{1,2000})["']/g;
-  let m;
+  const quotedRegex =
+    /["']([^"']{1,2000})["']/g;
 
-  while ((m = quotedRe.exec(source)) !== null) {
-    const val = m[1].trim();
+  let match;
 
-    if (/^https?:\/\//i.test(val) || /^\/[A-Za-z0-9_\-./?=&%]+/i.test(val)) {
-      add(val);
+  while (
+    (match =
+      quotedRegex.exec(source)) !==
+    null
+  ) {
+    const value =
+      match[1].trim();
+
+    if (
+      /^https?:\/\//i.test(
+        value
+      ) ||
+      /^\/[A-Za-z0-9_\-./?=&%]+/i.test(
+        value
+      )
+    ) {
+      add(value);
     }
   }
 
-  const attrRe =
+  const attributeRegex =
     /(?:href|src|data-src|data-url|data-video|data-file|data-stream|data-source|data-player)\s*=\s*["']([^"']+)["']/gi;
 
-  while ((m = attrRe.exec(source)) !== null) {
-    add(m[1]);
+  while (
+    (match =
+      attributeRegex.exec(
+        source
+      )) !== null
+  ) {
+    add(match[1]);
   }
 
-  out.sort((a, b) => {
-    const da = isFastStreamUrl(a) ? 0 : isDirectLink(a) ? 1 : 2;
-    const db = isFastStreamUrl(b) ? 0 : isDirectLink(b) ? 1 : 2;
-    return da - db;
-  });
+  output.sort(
+    (first, second) => {
+      const firstPriority =
+        isFastStreamUrl(first)
+          ? 0
+          : isDirectLink(first)
+            ? 1
+            : isMediaGatewayUrl(
+                  first
+                )
+              ? 2
+              : 3;
 
-  return out.slice(0, CANDIDATE_CAP);
+      const secondPriority =
+        isFastStreamUrl(second)
+          ? 0
+          : isDirectLink(second)
+            ? 1
+            : isMediaGatewayUrl(
+                  second
+                )
+              ? 2
+              : 3;
+
+      return (
+        firstPriority -
+        secondPriority
+      );
+    }
+  );
+
+  return output.slice(
+    0,
+    CANDIDATE_CAP
+  );
 }
 
-function cleanUrl(u) {
-  return String(u || "")
-    .replace(/[)"';\\]+$/g, "")
-    .replace(/&amp;/g, "&")
-    .replace(/&#038;/g, "&")
+function normalizeSource(text) {
+  return String(text || "")
+    .replace(/\\\//g, "/")
+    .replace(
+      /\\u0026/gi,
+      "&"
+    )
+    .replace(
+      /\\u003d/gi,
+      "="
+    )
+    .replace(
+      /\\u003a/gi,
+      ":"
+    )
+    .replace(
+      /\\u002f/gi,
+      "/"
+    )
+    .replace(
+      /&amp;/gi,
+      "&"
+    )
+    .replace(
+      /&#038;/gi,
+      "&"
+    );
+}
+
+function cleanUrl(value) {
+  return String(value || "")
+    .replace(
+      /[)"';\\]+$/g,
+      ""
+    )
+    .replace(
+      /&amp;/gi,
+      "&"
+    )
+    .replace(
+      /&#038;/gi,
+      "&"
+    )
     .trim();
+}
+
+function getErrorMessage(error) {
+  if (!error) {
+    return "Unknown error";
+  }
+
+  return (
+    error.message ||
+    String(error)
+  );
 }
